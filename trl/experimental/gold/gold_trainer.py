@@ -824,6 +824,8 @@ class GOLDTrainer(SFTTrainer):
                 ignore_index=-100,
                 temperature=args.temperature,
                 compiled=False,
+                weight_hard_loss=0.0,
+                weight_soft_loss=1.0,
             )
             self.use_liger_gkd_loss = True
 
@@ -1803,6 +1805,7 @@ class GOLDTrainer(SFTTrainer):
                     "attention_mask",
                     "position_ids",
                     "completion_mask",
+                    "messages",
                     "assistant_masks",
                     "original_prompt_text",
                     "original_completion_text",
@@ -1982,12 +1985,19 @@ class GOLDTrainer(SFTTrainer):
                 # Release full outputs to free memory
                 del student_outputs, teacher_outputs
 
+                # Flatten to (batch_size * seq_len, hidden_size) so liger_jsd_loss chunks
+                # on the token dimension (shape[0]) rather than the batch dimension.
+                # Without this, num_chunks = max(1, batch_size // 1024) = 1, meaning the
+                # full [batch_size, seq_len, vocab_size] logit tensor is materialised at once.
+                student_hidden = student_hidden.reshape(-1, student_hidden.shape[-1])
+                teacher_hidden = teacher_hidden.reshape(-1, teacher_hidden.shape[-1])
+
                 # labels mask and labels (shifted)
                 labels_mask = inputs["labels"] != -100
                 masked_input_ids = torch.where(
                     labels_mask, inputs["input_ids"], torch.full_like(inputs["input_ids"], -100)
                 )
-                true_labels = masked_input_ids[:, 1:].contiguous()
+                true_labels = masked_input_ids[:, 1:].contiguous().reshape(-1)
 
                 # heads
                 student_head = unwrapped_student.get_output_embeddings()
@@ -2029,6 +2039,7 @@ class GOLDTrainer(SFTTrainer):
                     teacher_logits=shifted_teacher_logits,
                     labels=shifted_labels,
                     beta=self.beta,
+                    temperature=self.temperature,
                 )
 
         if self.use_uld_loss:
