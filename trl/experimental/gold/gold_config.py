@@ -389,12 +389,6 @@ class GOLDConfig(SFTConfig):
     num_completions_to_print: int = field(default=5, metadata={"help": "Number of completions to print."})
     overwrite_hub_revision: bool = field(default=False, metadata={"help": "Whether to overwrite the Hub revision."})
     push_to_hub_revision: bool = field(default=False, metadata={"help": "Whether to push to a Hub revision/branch."})
-    trl_project: str = field(
-        default="smollm3",
-        metadata={
-            "help": "The TRL project to use for evaluation. This is used to determine the path to the evaluation script."
-        },
-    )
 
     def __post_init__(self):
         super().__post_init__()
