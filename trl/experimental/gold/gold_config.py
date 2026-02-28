@@ -54,14 +54,11 @@ class GOLDConfig(SFTConfig):
         seq_kd (`bool`, *optional*, defaults to `False`):
             Seq_kd parameter that controls whether to perform Sequence-Level KD (can be viewed as supervised FT on
             teacher-generated output).
-        steps_per_generation (`int` or `None`, *optional*, defaults to `None`):
-            Number of optimization steps per generation. If `None`, it defaults to
-            `gradient_accumulation_steps`.
         num_generations (`int`, *optional*, defaults to `1`):
             Number of generations per prompt. Each prompt is repeated this many times in the generation batch.
         generation_batch_size (`int` or `None`, *optional*, defaults to `None`):
-            Number of prompts per generation batch (global, across all processes). If `None`, it is computed from
-            `per_device_train_batch_size * world_size * steps_per_generation`.
+            Number of unique prompts per worker per optimizer step. If `None`, it is computed from
+            `(per_device_train_batch_size * gradient_accumulation_steps) // num_generations`.
         use_uld_loss (`bool`, *optional*, defaults to `False`):
             Whether to use Universal Logit Distillation (ULD) loss instead of Generalized Jensen-Shannon Divergence
             loss.
@@ -187,12 +184,6 @@ class GOLDConfig(SFTConfig):
             "FT on teacher-generated output)."
         },
     )
-    steps_per_generation: int | None = field(
-        default=None,
-        metadata={
-            "help": "Number of optimization steps per generation. If `None`, it defaults to gradient_accumulation_steps."
-        },
-    )
     num_generations: int = field(
         default=1,
         metadata={
@@ -202,8 +193,8 @@ class GOLDConfig(SFTConfig):
     generation_batch_size: int | None = field(
         default=None,
         metadata={
-            "help": "Number of prompts per generation batch (global, across all processes). "
-            "If None, computed from per_device_train_batch_size * num_processes * steps_per_generation."
+            "help": "Number of unique prompts per worker per optimizer step. "
+            "If None, computed from (per_device_train_batch_size * gradient_accumulation_steps) // num_generations."
         },
     )
 
@@ -405,25 +396,23 @@ class GOLDConfig(SFTConfig):
                 f"to leave room for the prompt. Consider increasing max_length or reducing max_completion_length."
             )
 
-        if self.steps_per_generation is None:
-            self.steps_per_generation = self.gradient_accumulation_steps
-
+        local_sequence_batch_size = self.per_device_train_batch_size * self.gradient_accumulation_steps
         if self.generation_batch_size is None:
-            self.generation_batch_size = (
-                self.per_device_train_batch_size * self.world_size * self.steps_per_generation
-            )
+            self.generation_batch_size = local_sequence_batch_size // self.num_generations
 
         if self.num_generations < 1:
             raise ValueError(f"num_generations must be at least 1, got {self.num_generations}.")
-        if self.generation_batch_size % self.num_generations != 0:
+        if self.generation_batch_size < 1:
             raise ValueError(
-                f"generation_batch_size ({self.generation_batch_size}) must be divisible by num_generations "
-                f"({self.num_generations})."
+                "generation_batch_size must be at least 1. "
+                f"Got generation_batch_size={self.generation_batch_size}."
             )
-        if self.generation_batch_size // self.num_generations < 1:
+        if self.generation_batch_size * self.num_generations != local_sequence_batch_size:
             raise ValueError(
-                f"generation_batch_size ({self.generation_batch_size}) must be at least num_generations "
-                f"({self.num_generations}) so that each generation batch contains at least one unique prompt."
+                "generation_batch_size and num_generations must exactly partition the local optimizer-step batch. "
+                f"Expected generation_batch_size * num_generations == per_device_train_batch_size * "
+                f"gradient_accumulation_steps, but got {self.generation_batch_size} * {self.num_generations} != "
+                f"{self.per_device_train_batch_size} * {self.gradient_accumulation_steps} ({local_sequence_batch_size})."
             )
         if self.num_generations > 1 and self.lmbda < 1.0:
             warnings.warn(
