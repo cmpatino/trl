@@ -26,10 +26,10 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from accelerate import PartialState
-from accelerate.utils import DistributedType, broadcast_object_list, gather_object, is_peft_model
+from accelerate.utils import DistributedType, broadcast_object_list, gather_object
 from datasets import Dataset, IterableDataset
 from torch.utils.data import DataLoader
-from transformers import AutoTokenizer, TrainerCallback, TrainerControl, TrainerState
+from transformers import AutoTokenizer, TrainerCallback
 from transformers.data.data_collator import DataCollator
 from transformers.feature_extraction_utils import FeatureExtractionMixin
 from transformers.generation.configuration_utils import GenerationConfig
@@ -740,7 +740,6 @@ class ULDLoss(nn.Module):
             answers_index.append(int(valid_indices[0].item()))
             answers_size.append(int(answer_mask.sum().item()))
         return answers_index, answers_size
-
 
 
 class GOLDTrainer(SFTTrainer):
