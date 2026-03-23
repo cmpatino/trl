@@ -949,7 +949,7 @@ class GOLDTrainer(SFTTrainer):
                 server_timeout=args.vllm_server_timeout,
                 tensor_parallel_size=args.vllm_tensor_parallel_size,
                 gpu_memory_utilization=args.vllm_gpu_memory_utilization,
-                max_model_length=args.vllm_max_model_length,
+                max_model_length=args.vllm_max_model_length or args.max_length,
                 max_num_seqs=args.per_device_train_batch_size * args.gradient_accumulation_steps,
                 enable_sleep_mode=args.vllm_enable_sleep_mode,
                 model_impl=args.vllm_model_impl,
