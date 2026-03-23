@@ -962,7 +962,7 @@ class GOLDTrainer(SFTTrainer):
                 logprobs=None,
             )
             self.vllm_sync_frequency = args.vllm_sync_frequency
-            self._last_vllm_sync_step = -1
+            self._last_vllm_sync_step = -self.vllm_sync_frequency
 
     def _set_signature_columns_if_needed(self):
         super()._set_signature_columns_if_needed()
@@ -1179,7 +1179,7 @@ class GOLDTrainer(SFTTrainer):
 
         if (
             self.state.global_step != self._last_vllm_sync_step
-            and self.state.global_step % self.vllm_sync_frequency == 0
+            and self.state.global_step >= self._last_vllm_sync_step + self.vllm_sync_frequency
         ):
             self.vllm_generation.sync_weights()
             self._last_vllm_sync_step = self.state.global_step
