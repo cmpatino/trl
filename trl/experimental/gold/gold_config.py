@@ -97,8 +97,8 @@ class GOLDConfig(SFTConfig):
             Base URL for the vLLM server (e.g., `"http://localhost:8001"`). If provided, `vllm_server_host` and
             `vllm_server_port` are ignored.
         vllm_group_port (`int`, *optional*, defaults to `51216`):
-            Port for the vLLM weight-update group (NCCL communicator). Unless the port is occupied, there is no need
-            to change it.
+            Port for the vLLM weight-update group (NCCL communicator). Unless the port is occupied, there is no need to
+            change it.
         vllm_max_model_length (`int`, *optional*):
             Maximum model sequence length for the colocated vLLM engine when `vllm_mode="colocate"`. Defaults to the
             model's maximum context length.
