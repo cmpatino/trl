@@ -1159,10 +1159,19 @@ class GOLDTrainer(SFTTrainer):
                 local_prompts.append(prompt)
                 local_slice_indices.append(slice_idx)
 
+        stacked_prompts = torch.stack(local_prompts) if local_prompts else torch.empty(0, dtype=torch.long)
+
         prompts_text_with_special = self.processing_class.batch_decode(
-            torch.stack(local_prompts) if local_prompts else torch.empty(0, dtype=torch.long),
+            stacked_prompts,
             skip_special_tokens=False,
         )
+
+        prompts_text = self.processing_class.batch_decode(
+            stacked_prompts,
+            skip_special_tokens=True,
+        )
+        if self.processing_class.pad_token:
+            prompts_text = [p.replace(self.processing_class.pad_token, "") for p in prompts_text]
 
         if not self.use_vllm:
             self._generate_non_vllm_for_slices(slices, on_policy_indices)
@@ -1175,7 +1184,10 @@ class GOLDTrainer(SFTTrainer):
             self.vllm_generation.sync_weights()
             self._last_vllm_sync_step = self.state.global_step
 
-        prompt_ids_list = [p.tolist() for p in local_prompts]
+        pad_token_id = self.processing_class.pad_token_id
+        prompt_ids_list = [
+            [tok for tok in p.tolist() if tok != pad_token_id] for p in local_prompts
+        ]
         _, completion_ids, _, _ = self.vllm_generation.generate(
             prompts=prompt_ids_list,
             images=None,
@@ -1187,7 +1199,7 @@ class GOLDTrainer(SFTTrainer):
             on_policy_indices,
             local_slice_indices,
             completion_ids,
-            prompts_text_with_special,
+            prompts_text,
             prompts_text_with_special,
             self.generation_config.max_new_tokens,
         )
