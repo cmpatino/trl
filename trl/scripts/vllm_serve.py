@@ -15,6 +15,7 @@
 import argparse
 import base64
 import logging
+import math
 import os
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
@@ -640,6 +641,87 @@ def main(script_args: ScriptArguments):
             "logprobs": logprobs,
             "logprob_token_ids": logprob_token_ids,
         }
+
+    class SequenceLogprobsRequest(BaseModel):
+        sequences: list[list[int]]
+        prompt_lengths: list[int]
+        top_logprobs: int = 100
+
+    class SequenceLogprobsResponse(BaseModel):
+        logprobs: list[list[list[float | None]]]
+        logprob_token_ids: list[list[list[int]]]
+
+    @app.post("/get_sequence_logprobs/", response_model=SequenceLogprobsResponse)
+    async def get_sequence_logprobs(request: SequenceLogprobsRequest):
+        """
+        Computes teacher logprobs for existing token sequences without generating new tokens.
+
+        Sends the full sequence (prompt + completion) as the vLLM prompt with `max_tokens=1` and
+        `prompt_logprobs=top_logprobs`. Returns logprobs only for the completion region (positions
+        from `prompt_length` onwards) for each sequence.
+
+        Args:
+            request (`SequenceLogprobsRequest`):
+                - `sequences` (list of list of `int`): Full token ID sequences (prompt + completion).
+                - `prompt_lengths` (list of `int`): Number of prompt tokens in each sequence. Logprobs
+                  are returned starting from this position.
+                - `top_logprobs` (`int`, *optional*, defaults to `100`): Number of top logprobs per position.
+
+        Returns:
+            `SequenceLogprobsResponse`:
+                - `logprobs` (list of list of list of `float`): Per-token logprobs of shape
+                  (batch, completion_len, top_logprobs), sorted by descending probability.
+                - `logprob_token_ids` (list of list of list of `int`): Token IDs corresponding to each
+                  logprob, same shape as `logprobs`.
+        """
+        if len(request.sequences) != len(request.prompt_lengths):
+            raise ValueError("sequences and prompt_lengths must have the same length.")
+
+        prompts = [{"prompt_token_ids": seq} for seq in request.sequences]
+        sampling_params = SamplingParams(
+            max_tokens=1,
+            temperature=1.0,
+            prompt_logprobs=request.top_logprobs,
+        )
+
+        chunked_prompts = chunk_list(prompts, script_args.data_parallel_size)
+
+        for connection, chunk in zip(connections, chunked_prompts, strict=True):
+            if not chunk:
+                chunk = [{"prompt_token_ids": [0]}]
+            kwargs = {"prompts": chunk, "sampling_params": sampling_params}
+            connection.send({"type": "call", "method": "generate", "kwargs": kwargs})
+
+        all_outputs = [connection.recv() for connection in connections]
+        all_outputs = [output for output, chunk in zip(all_outputs, chunked_prompts, strict=True) if chunk]
+        all_outputs = list(chain.from_iterable(all_outputs))
+
+        all_logprobs = []
+        all_token_ids = []
+        for output, prompt_length in zip(all_outputs, request.prompt_lengths, strict=True):
+            # prompt_logprobs is a list of dicts, one per prompt token (first token is None)
+            prompt_lps = output.prompt_logprobs
+            if prompt_lps is None:
+                raise ValueError("prompt_logprobs is None. Ensure the vLLM server supports prompt_logprobs.")
+
+            seq_logprobs = []
+            seq_token_ids = []
+            # Extract logprobs only for the completion region
+            for pos in range(prompt_length, len(prompt_lps)):
+                lp = prompt_lps[pos]
+                if lp is None:
+                    seq_logprobs.append([])
+                    seq_token_ids.append([])
+                    continue
+                sorted_items = sorted(lp.items(), key=lambda x: x[1].rank)
+                seq_token_ids.append([token_id for token_id, _ in sorted_items])
+                seq_logprobs.append(
+                    [None if math.isnan(item.logprob) else item.logprob for _, item in sorted_items]
+                )
+            all_logprobs.append(seq_logprobs)
+            all_token_ids.append(seq_token_ids)
+
+        return {"logprobs": all_logprobs, "logprob_token_ids": all_token_ids}
 
     class ChatRequest(BaseModel):
         messages: list[list[dict]]

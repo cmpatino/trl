@@ -523,6 +523,53 @@ class VLLMClient:
             # Update each parameter individually
             self.update_named_param(name, param.data)
 
+    def get_sequence_logprobs(
+        self,
+        sequences: list[list[int]],
+        prompt_lengths: list[int],
+        top_logprobs: int = 100,
+    ) -> dict[str, list]:
+        """
+        Computes teacher logprobs for existing token sequences without generating new tokens.
+
+        Sends full sequences (prompt + completion) to the vLLM server and retrieves per-token top-k logprobs for the
+        completion region only. This is used for knowledge distillation where the teacher model evaluates existing
+        sequences rather than generating new ones.
+
+        Args:
+            sequences (`list[list[int]]`):
+                List of full token ID sequences (prompt + completion).
+            prompt_lengths (`list[int]`):
+                Number of prompt tokens in each sequence. Logprobs are returned starting from this position.
+            top_logprobs (`int`, *optional*, defaults to `100`):
+                Number of top logprobs to return per token position.
+
+        Returns:
+            `dict` with keys:
+                - `logprobs` (`list[list[list[float]]]`):
+                    Per-token logprobs of shape (batch, completion_len, top_logprobs), sorted by descending
+                    probability.
+                - `logprob_token_ids` (`list[list[list[int]]]`):
+                    Token IDs corresponding to each logprob, same shape as `logprobs`.
+        """
+        url = f"{self.base_url}/get_sequence_logprobs/"
+        response = self.session.post(
+            url,
+            json={
+                "sequences": sequences,
+                "prompt_lengths": prompt_lengths,
+                "top_logprobs": top_logprobs,
+            },
+        )
+        if response.status_code == 200:
+            json_response = response.json()
+            return {
+                "logprobs": json_response["logprobs"],
+                "logprob_token_ids": json_response["logprob_token_ids"],
+            }
+        else:
+            raise Exception(f"Request failed: {response.status_code}, {response.text}")
+
     def reset_prefix_cache(self):
         """
         Resets the prefix cache for the model.
