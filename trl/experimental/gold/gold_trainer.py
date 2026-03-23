@@ -1185,9 +1185,7 @@ class GOLDTrainer(SFTTrainer):
             self._last_vllm_sync_step = self.state.global_step
 
         pad_token_id = self.processing_class.pad_token_id
-        prompt_ids_list = [
-            [tok for tok in p.tolist() if tok != pad_token_id] for p in local_prompts
-        ]
+        prompt_ids_list = [[tok for tok in p.tolist() if tok != pad_token_id] for p in local_prompts]
         _, completion_ids, _, _ = self.vllm_generation.generate(
             prompts=prompt_ids_list,
             images=None,
