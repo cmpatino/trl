@@ -1113,7 +1113,9 @@ class GOLDTrainer(SFTTrainer):
                 new_attention_mask[new_input_ids == pad_token_id] = 0
 
         new_labels = torch.full_like(new_input_ids, -100)
-        new_labels[completion_mask & new_attention_mask.bool()] = new_input_ids[completion_mask & new_attention_mask.bool()]
+        new_labels[completion_mask & new_attention_mask.bool()] = new_input_ids[
+            completion_mask & new_attention_mask.bool()
+        ]
         if attention_mask is None and pad_token_id is not None:
             new_labels[new_input_ids == pad_token_id] = -100
 
@@ -1293,7 +1295,9 @@ class GOLDTrainer(SFTTrainer):
                     truncated_completion_tensor = completion_tensor[:max_completion_length]
                     padded_completion_ids_list.append(truncated_completion_tensor)
                     completion_ids_for_text.append(truncated_completion_tensor.tolist())
-                    completion_attention_masks.append(torch.ones(len(truncated_completion_tensor), device=device, dtype=torch.long))
+                    completion_attention_masks.append(
+                        torch.ones(len(truncated_completion_tensor), device=device, dtype=torch.long)
+                    )
                 elif len(completion_tensor) < max_completion_length:
                     padding_needed = max_completion_length - len(completion_tensor)
                     padded_tensor = torch.cat(
@@ -1320,7 +1324,9 @@ class GOLDTrainer(SFTTrainer):
                 else:
                     padded_completion_ids_list.append(completion_tensor)
                     completion_ids_for_text.append(completion_tensor.tolist())
-                    completion_attention_masks.append(torch.ones(len(completion_tensor), device=device, dtype=torch.long))
+                    completion_attention_masks.append(
+                        torch.ones(len(completion_tensor), device=device, dtype=torch.long)
+                    )
 
             completion_ids_padded = torch.stack(padded_completion_ids_list)
             completion_attention_mask = torch.stack(completion_attention_masks)
