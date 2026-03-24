@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+from types import SimpleNamespace
 
 import torch
 from datasets import Dataset, load_dataset
@@ -91,6 +92,146 @@ class TestSDPOTrainer(TrlTestCase):
         assert trainer.args.output_dir == self.tmp_dir
         assert trainer.args.include_environment_feedback is True
         assert trainer.state.log_history[-1]["train_loss"] is not None
+
+    def test_vllm_initial_sync_and_generation_kwargs_match_reference_trainers(self, monkeypatch):
+        from trl.experimental.self_distillation import base_self_distillation_trainer as base_module
+        from trl.generation import vllm_generation as vllm_generation_module
+
+        dataset = Dataset.from_dict({"prompt": ["Solve 2+2."]})
+        generation_kwargs = {"num_beams": 2, "length_penalty": -0.1}
+
+        class FakeModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = SimpleNamespace(model_type="fake")
+                self.training = True
+
+            def forward(self, input_ids=None, attention_mask=None):
+                return SimpleNamespace(logits=torch.zeros(1))
+
+        class FakeTokenizer:
+            pad_token = "<pad>"
+            pad_token_id = 0
+            eos_token = "<eos>"
+            eos_token_id = 2
+            bos_token_id = 1
+
+            def __call__(self, text, **kwargs):
+                return {"input_ids": [[11, 12] for _ in text]}
+
+        class FakeVLLMGeneration:
+            def __init__(self, **kwargs):
+                self.init_kwargs = kwargs
+                self.sync_weights_call_count = 0
+                self.generate_calls = []
+
+            def sync_weights(self):
+                self.sync_weights_call_count += 1
+
+            def generate(self, prompts, images, num_generations):
+                self.generate_calls.append(
+                    {
+                        "prompts": prompts,
+                        "images": images,
+                        "num_generations": num_generations,
+                    }
+                )
+                return prompts, [[101, 102]], None, None
+
+        def fake_base_trainer_init(
+            self,
+            model,
+            args,
+            data_collator,
+            train_dataset,
+            eval_dataset,
+            processing_class,
+            callbacks,
+            optimizers,
+            compute_loss_func,
+        ):
+            self.model = model
+            self.args = args
+            self.processing_class = processing_class
+            self.accelerator = SimpleNamespace(device=torch.device("cpu"))
+            self.is_fsdp_enabled = False
+            self.is_deepspeed_enabled = False
+            self.model_wrapped = model
+
+        args = SimpleNamespace(
+            use_vllm=True,
+            model_init_kwargs=None,
+            distributed_state=SimpleNamespace(distributed_type="NO"),
+            temperature=1.0,
+            max_prompt_length=16,
+            max_completion_length=8,
+            num_generations=1,
+            num_generations_eval=None,
+            num_iterations=1,
+            shuffle_dataset=True,
+            loss_type="dapo",
+            importance_sampling_level="token",
+            scale_rewards="group",
+            epsilon=0.2,
+            epsilon_high=None,
+            beta=0.0,
+            mask_truncated_completions=False,
+            chat_template_kwargs=None,
+            top_p=1.0,
+            top_k=0,
+            min_p=None,
+            repetition_penalty=1.0,
+            cache_implementation=None,
+            generation_kwargs=generation_kwargs,
+            vllm_mode="colocate",
+            vllm_server_base_url=None,
+            vllm_server_host="0.0.0.0",
+            vllm_server_port=8000,
+            vllm_group_port=51216,
+            vllm_server_timeout=240.0,
+            vllm_tensor_parallel_size=1,
+            vllm_gpu_memory_utilization=0.3,
+            vllm_max_model_length=None,
+            per_device_train_batch_size=1,
+            steps_per_generation=1,
+            vllm_enable_sleep_mode=False,
+            vllm_model_impl="auto",
+            disable_dropout=False,
+            reward_weights=None,
+            sync_ref_model=False,
+            teacher_regularization="none",
+        )
+
+        monkeypatch.setattr(base_module, "PreTrainedTokenizerBase", object)
+        monkeypatch.setattr(base_module._BaseTrainer, "__init__", fake_base_trainer_init)
+        monkeypatch.setattr(vllm_generation_module, "VLLMGeneration", FakeVLLMGeneration)
+
+        trainer = SDPOTrainer(
+            model=FakeModel(),
+            reward_funcs=lambda **kwargs: [0.0] * len(kwargs["prompts"]),
+            args=args,
+            train_dataset=dataset,
+            processing_class=FakeTokenizer(),
+        )
+        trainer.state = SimpleNamespace(global_step=0)
+        trainer._apply_prompt_template = lambda prompts: prompts
+
+        assert trainer._last_loaded_step == -1
+        assert trainer.vllm_generation.init_kwargs["generation_kwargs"] == generation_kwargs
+
+        prompt_ids, completion_ids = trainer._generate(["Solve 2+2."])
+
+        assert prompt_ids == [[11, 12]]
+        assert completion_ids == [[101, 102]]
+        assert trainer.vllm_generation.sync_weights_call_count == 1
+        assert trainer._last_loaded_step == 0
+        assert trainer.vllm_generation.generate_calls == [
+            {
+                "prompts": [[11, 12]],
+                "images": None,
+                "num_generations": 1,
+            }
+        ]
 
     def test_training(self):
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
