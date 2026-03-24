@@ -26,8 +26,8 @@
 # Full training (off-policy only, lmbda=0):
 ```
 python trl/scripts/distillation.py \
-    --model_name_or_path meta-llama/Llama-3.2-1B-Instruct \
-    --teacher_model_name_or_path Qwen/Qwen2-1.5B-Instruct \
+    --model_name_or_path Qwen/Qwen2.5-0.5B-Instruct \
+    --teacher_model_name_or_path Qwen/Qwen2.5-1.5B-Instruct \
     --dataset_name trl-lib/chatbot_arena_completions \
     --learning_rate 2e-5 \
     --per_device_train_batch_size 4 \
@@ -40,8 +40,8 @@ python trl/scripts/distillation.py \
 # Mixed on/off-policy (lmbda=0.5):
 ```
 python trl/scripts/distillation.py \
-    --model_name_or_path meta-llama/Llama-3.2-1B-Instruct \
-    --teacher_model_name_or_path Qwen/Qwen2-1.5B-Instruct \
+    --model_name_or_path Qwen/Qwen2.5-0.5B-Instruct \
+    --teacher_model_name_or_path Qwen/Qwen2.5-1.5B-Instruct \
     --dataset_name trl-lib/chatbot_arena_completions \
     --learning_rate 2e-5 \
     --per_device_train_batch_size 4 \
@@ -55,8 +55,8 @@ python trl/scripts/distillation.py \
 # LoRA:
 ```
 python trl/scripts/distillation.py \
-    --model_name_or_path meta-llama/Llama-3.2-1B-Instruct \
-    --teacher_model_name_or_path Qwen/Qwen2-1.5B-Instruct \
+    --model_name_or_path Qwen/Qwen2.5-0.5B-Instruct \
+    --teacher_model_name_or_path Qwen/Qwen2.5-1.5B-Instruct \
     --dataset_name trl-lib/chatbot_arena_completions \
     --learning_rate 2e-4 \
     --per_device_train_batch_size 4 \

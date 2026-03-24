@@ -14,6 +14,7 @@
 
 import random
 import textwrap
+import warnings
 from collections import defaultdict, deque
 from collections.abc import Callable
 from contextlib import nullcontext
@@ -273,6 +274,11 @@ class DistillationTrainer(_BaseTrainer):
             import json
 
             model_init_kwargs = json.loads(model_init_kwargs)
+        teacher_model_init_kwargs = args.teacher_model_init_kwargs or {}
+        if isinstance(teacher_model_init_kwargs, str):
+            import json
+
+            teacher_model_init_kwargs = json.loads(teacher_model_init_kwargs)
         if isinstance(model, str):
             model_name_or_path = model
             model = create_model_from_path(model, **model_init_kwargs)
@@ -313,25 +319,58 @@ class DistillationTrainer(_BaseTrainer):
 
         # ── Teacher model setup ──
         self.teacher_client = None
+        self._local_teacher_tokenizer_matches_student = True
         if args.teacher_model_server_url is not None:
             from ..generation.vllm_client import VLLMClient
 
             self.teacher_client = VLLMClient(base_url=args.teacher_model_server_url, connection_timeout=60.0)
             teacher_model = None
         elif teacher_model is not None:
-            if args.teacher_model_init_kwargs is None:
-                teacher_model_init_kwargs = {}
-            elif not isinstance(teacher_model, str):
+            if args.teacher_model_init_kwargs is not None and not isinstance(teacher_model, str):
                 raise ValueError(
                     "You passed teacher_model_init_kwargs to the config, but your teacher_model is already "
                     "instantiated."
                 )
-            else:
-                teacher_model_init_kwargs = args.teacher_model_init_kwargs
+
+            teacher_model_name_or_path = (
+                teacher_model
+                if isinstance(teacher_model, str)
+                else getattr(getattr(teacher_model, "config", None), "_name_or_path", None)
+            )
+            if teacher_model_name_or_path is None:
+                raise ValueError(
+                    "DistillationTrainer requires a local teacher model with `config._name_or_path` set so its "
+                    "tokenizer can be validated against the student tokenizer."
+                )
+
+            teacher_tokenizer_kwargs = {}
+            teacher_revision = teacher_model_init_kwargs.get("revision", args.teacher_model_revision)
+            if teacher_revision is not None:
+                teacher_tokenizer_kwargs["revision"] = teacher_revision
+            if teacher_model_init_kwargs.get("trust_remote_code") is not None:
+                teacher_tokenizer_kwargs["trust_remote_code"] = teacher_model_init_kwargs["trust_remote_code"]
+            teacher_processing_class = AutoTokenizer.from_pretrained(
+                teacher_model_name_or_path, **teacher_tokenizer_kwargs
+            )
+            if getattr(teacher_processing_class, "pad_token", None) is None:
+                teacher_processing_class.pad_token = teacher_processing_class.eos_token
+            self._local_teacher_tokenizer_matches_student = self._local_teacher_tokenizers_match(
+                processing_class, teacher_processing_class
+            )
+            if not self._local_teacher_tokenizer_matches_student:
+                warnings.warn(
+                    "DistillationTrainer's built-in local-teacher loss assumes the student and teacher share the "
+                    "same tokenizer. The loaded local teacher tokenizer does not match the student tokenizer, so "
+                    "the teacher weights will be left unchanged for subclass overrides. Direct use of the base "
+                    "DistillationTrainer with this local teacher remains unsupported.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
+            if isinstance(teacher_model, str):
+                torch_dtype = teacher_model_init_kwargs.get("torch_dtype")
                 teacher_model_init_kwargs["torch_dtype"] = (
-                    teacher_model_init_kwargs["torch_dtype"]
-                    if teacher_model_init_kwargs.get("torch_dtype") in ["auto", None]
-                    else getattr(torch, teacher_model_init_kwargs["torch_dtype"])
+                    torch_dtype if torch_dtype in ["auto", None] else getattr(torch, torch_dtype)
                 )
 
             if isinstance(teacher_model, str):
@@ -361,7 +400,8 @@ class DistillationTrainer(_BaseTrainer):
 
         # ── Prepare teacher model (after super().__init__ so accelerator is ready) ──
         if teacher_model is not None:
-            teacher_model.resize_token_embeddings(self.model.config.vocab_size)
+            if self._local_teacher_tokenizer_matches_student:
+                teacher_model.resize_token_embeddings(self.model.config.vocab_size)
             if self.is_deepspeed_enabled:
                 self.teacher_model = prepare_deepspeed(teacher_model, self.accelerator)
             else:
@@ -456,6 +496,54 @@ class DistillationTrainer(_BaseTrainer):
             )
             self.vllm_sync_frequency = args.vllm_sync_frequency
             self._last_vllm_sync_step = -1
+
+    @staticmethod
+    def _local_teacher_tokenizers_match(
+        student_processing_class: PreTrainedTokenizerBase,
+        teacher_processing_class: PreTrainedTokenizerBase,
+    ) -> bool:
+        """Check whether the student and local teacher tokenizers share the same vocabulary."""
+        return student_processing_class.get_vocab() == teacher_processing_class.get_vocab()
+
+    def _raise_if_local_teacher_tokenizer_mismatch(self) -> None:
+        """Guard the base local-teacher JSD path, while still allowing subclass overrides."""
+        if self.teacher_model is not None and not self._local_teacher_tokenizer_matches_student:
+            raise ValueError(
+                "DistillationTrainer's built-in local-teacher loss only supports student/teacher pairs that use "
+                "the same tokenizer. Use a same-tokenizer local teacher, use `teacher_model_server_url`, or "
+                "override the local teacher loss path in a subclass."
+            )
+
+    def _get_completion_lengths(self, generated_tokens: torch.Tensor, prompt_width: int) -> torch.Tensor:
+        """Infer per-sample completion lengths from generated tokens."""
+        completion_tokens = generated_tokens[:, prompt_width:]
+        pad_token_id = self.processing_class.pad_token_id
+        eos_token_id = self.generation_config.eos_token_id
+        if eos_token_id is None:
+            eos_token_ids = set()
+        elif isinstance(eos_token_id, int):
+            eos_token_ids = {eos_token_id}
+        else:
+            eos_token_ids = set(eos_token_id)
+        pad_equals_eos = pad_token_id is not None and pad_token_id in eos_token_ids
+
+        completion_lengths = []
+        for row in completion_tokens.tolist():
+            if pad_equals_eos and eos_token_ids:
+                completion_length = len(row)
+                for idx, token_id in enumerate(row):
+                    if token_id in eos_token_ids:
+                        completion_length = idx + 1
+                        break
+            elif pad_token_id is not None:
+                completion_length = len(row)
+                while completion_length > 0 and row[completion_length - 1] == pad_token_id:
+                    completion_length -= 1
+            else:
+                completion_length = len(row)
+            completion_lengths.append(completion_length)
+
+        return torch.tensor(completion_lengths, device=generated_tokens.device, dtype=torch.long)
 
     # ──────────────────────────────────────────────────────────────────────
     #  Dataset / Dataloader
@@ -626,18 +714,20 @@ class DistillationTrainer(_BaseTrainer):
                 batch_size = generated_tokens.size(0)
                 device = generated_tokens.device
                 pad_token_id = self.processing_class.pad_token_id
-
-                prompt_lengths = torch.full(
-                    (batch_size,), slice_inputs["prompts"].shape[1], dtype=torch.long, device=device
-                )
+                prompt_width = slice_inputs["prompts"].shape[1]
+                prompt_mask = slice_inputs.get("prompt_attention_mask")
+                if prompt_mask is not None:
+                    prompt_token_lengths = prompt_mask.sum(dim=1)
+                else:
+                    prompt_token_lengths = torch.full((batch_size,), prompt_width, dtype=torch.long, device=device)
+                completion_lengths = self._get_completion_lengths(generated_tokens, prompt_width)
                 new_attention_mask, new_labels = self._build_sequence_batch(
-                    generated_tokens, prompt_lengths, pad_token_id
+                    generated_tokens, prompt_width, prompt_token_lengths, completion_lengths
                 )
 
                 # Decode for logging
                 prompt_texts = []
                 completion_texts = []
-                prompt_mask = slice_inputs.get("prompt_attention_mask")
                 for idx in range(batch_size):
                     prompt_tokens = slice_inputs["prompts"][idx]
                     if prompt_mask is not None:
@@ -647,9 +737,13 @@ class DistillationTrainer(_BaseTrainer):
                     prompt_texts.append(
                         self.processing_class.decode(prompt_tokens.tolist(), skip_special_tokens=False)
                     )
-                    length = int(prompt_lengths[idx].item())
+                    length = prompt_width
+                    completion_length = int(completion_lengths[idx].item())
                     completion_texts.append(
-                        self.processing_class.decode(generated_tokens[idx, length:].tolist(), skip_special_tokens=False)
+                        self.processing_class.decode(
+                            generated_tokens[idx, length : length + completion_length].tolist(),
+                            skip_special_tokens=False,
+                        )
                     )
 
                 updated = dict(slice_inputs)
@@ -687,22 +781,29 @@ class DistillationTrainer(_BaseTrainer):
         for slice_idx in on_policy_indices:
             slice_inputs = slices[slice_idx]
             prompt_id_tensors = slice_prompt_ids[slice_idx]
+            prompt_width = max(len(p) for p in prompt_id_tensors)
+            prompt_token_lengths = torch.tensor([len(p) for p in prompt_id_tensors], device=device, dtype=torch.long)
+            prompt_attention_mask = (
+                torch.arange(prompt_width, device=device).unsqueeze(0)
+                >= (prompt_width - prompt_token_lengths).unsqueeze(1)
+            ).long()
 
             # Left-pad prompt token IDs to the longest prompt in this slice
-            max_prompt_len = max(len(p) for p in prompt_id_tensors)
             prompt_ids = torch.stack([
-                F.pad(p, (max_prompt_len - len(p), 0), value=pad_token_id)
+                F.pad(p, (prompt_width - len(p), 0), value=pad_token_id)
                 for p in prompt_id_tensors
             ]).to(device)
 
             # Pad/truncate completions (right-pad to max_completion_length)
             completion_tensors = []
             completion_ids_for_text = []
+            completion_lengths = []
             for comp_ids in slice_completions[slice_idx]:
                 t = torch.tensor(comp_ids, device=device)
                 if len(t) > max_completion_length:
                     t = t[:max_completion_length]
                 completion_ids_for_text.append(t.tolist())
+                completion_lengths.append(len(t))
                 if len(t) < max_completion_length:
                     padding = torch.full(
                         (max_completion_length - len(t),), pad_token_id, device=device, dtype=t.dtype
@@ -712,8 +813,10 @@ class DistillationTrainer(_BaseTrainer):
 
             completion_ids_padded = torch.stack(completion_tensors)
             new_input_ids = torch.cat([prompt_ids, completion_ids_padded], dim=1)
-            prompt_lengths = torch.full((prompt_ids.shape[0],), prompt_ids.shape[1], device=device)
-            new_attention_mask, new_labels = self._build_sequence_batch(new_input_ids, prompt_lengths, pad_token_id)
+            completion_lengths = torch.tensor(completion_lengths, device=device, dtype=torch.long)
+            new_attention_mask, new_labels = self._build_sequence_batch(
+                new_input_ids, prompt_width, prompt_token_lengths, completion_lengths
+            )
 
             # Decode for logging only
             prompt_texts = self.processing_class.batch_decode(
@@ -729,27 +832,32 @@ class DistillationTrainer(_BaseTrainer):
             updated["labels"] = new_labels
             # Update prompts to match the new padding width so prompt_length is consistent
             updated["prompts"] = prompt_ids
+            updated["prompt_attention_mask"] = prompt_attention_mask
 
             self._buffered_inputs[slice_idx] = updated
             self._buffered_text_logs[slice_idx] = (prompt_texts, completion_texts)
 
     @staticmethod
     def _build_sequence_batch(
-        new_input_ids: torch.Tensor, prompt_lengths: torch.Tensor, pad_token_id: int | None
+        new_input_ids: torch.Tensor,
+        prompt_width: int,
+        prompt_token_lengths: torch.Tensor,
+        completion_lengths: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build attention mask and labels from full sequences and prompt lengths."""
-        prompt_lengths = prompt_lengths.to(device=new_input_ids.device, dtype=torch.long)
+        """Build attention mask and labels from prompt/completion lengths."""
+        prompt_token_lengths = prompt_token_lengths.to(device=new_input_ids.device, dtype=torch.long)
+        completion_lengths = completion_lengths.to(device=new_input_ids.device, dtype=torch.long)
         positions = torch.arange(new_input_ids.shape[1], device=new_input_ids.device).unsqueeze(0)
-        completion_mask = positions >= prompt_lengths.unsqueeze(1)
-
-        new_attention_mask = torch.ones_like(new_input_ids)
-        if pad_token_id is not None:
-            new_attention_mask[new_input_ids == pad_token_id] = 0
+        prompt_mask = (positions < prompt_width) & (
+            positions >= (prompt_width - prompt_token_lengths).unsqueeze(1)
+        )
+        completion_mask = (positions >= prompt_width) & (
+            positions < (prompt_width + completion_lengths).unsqueeze(1)
+        )
+        new_attention_mask = (prompt_mask | completion_mask).long()
 
         new_labels = torch.full_like(new_input_ids, -100)
         new_labels[completion_mask] = new_input_ids[completion_mask]
-        if pad_token_id is not None:
-            new_labels[new_input_ids == pad_token_id] = -100
 
         return new_attention_mask, new_labels
 
@@ -912,6 +1020,8 @@ class DistillationTrainer(_BaseTrainer):
         return teacher_logprobs
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        self._raise_if_local_teacher_tokenizer_mismatch()
+
         if self.use_liger_loss:
             loss = self._compute_liger_loss(model, inputs)
             return (loss, None) if return_outputs else loss
