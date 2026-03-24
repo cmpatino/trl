@@ -178,6 +178,14 @@ class DistillationConfig(_BaseConfig):
         default=256,
         metadata={"help": "Maximum number of tokens to generate per completion."},
     )
+    max_prompt_length: int | None = field(
+        default=None,
+        metadata={
+            "help": "Maximum number of tokens for the prompt. If None, auto-computed as "
+            "max_length - max_completion_length. Prompts are truncated from the left to preserve "
+            "the most recent context near the generation point."
+        },
+    )
     disable_dropout: bool = field(
         default=True,
         metadata={"help": "Whether to disable dropout in the student model during training."},
@@ -319,6 +327,9 @@ class DistillationConfig(_BaseConfig):
                 f"max_completion_length ({self.max_completion_length}) must be smaller than "
                 f"max_length ({self.max_length}) to leave room for the prompt."
             )
+
+        if self.max_prompt_length is None and self.max_length is not None:
+            self.max_prompt_length = self.max_length - self.max_completion_length
 
         if self.num_generations < 1:
             raise ValueError(f"num_generations must be at least 1, got {self.num_generations}.")

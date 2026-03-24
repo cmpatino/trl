@@ -43,7 +43,6 @@ from transformers.utils import (
     is_rich_available,
 )
 
-from ..experimental.utils import DataCollatorForChatML
 from ..extras.profiling import profiling_decorator
 from ..generation.vllm_generation import VLLMGeneration
 from ..import_utils import is_vllm_available
@@ -100,6 +99,121 @@ def _print_completions_sample(prompts: list[str], completions: list[str], step: 
 
     panel = Panel(table, expand=False, title=f"Step {step}", border_style="bold white")
     console.print(panel)
+
+
+class _DistillationCollator:
+    """Data collator for the distillation trainer with independent prompt/completion budgets.
+
+    Unlike ``DataCollatorForChatML``, this collator tokenizes prompts and completions separately so
+    that long completions can never truncate the prompt to empty.  It also handles prompt-only data
+    (no assistant completions) for pure on-policy distillation (``lmbda=1``).
+    """
+
+    def __init__(
+        self,
+        tokenizer: "PreTrainedTokenizerBase",
+        max_length: int,
+        max_prompt_length: int,
+        messages_key: str = "messages",
+        ignore_index: int = -100,
+    ):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.max_prompt_length = max_prompt_length
+        self.messages_key = messages_key
+        self.ignore_index = ignore_index
+
+        if tokenizer.pad_token_id is None:
+            raise ValueError("The tokenizer does not have a pad token. Please set `pad_token_id` in the tokenizer.")
+
+    def __call__(self, examples: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+        all_input_ids: list[list[int]] = []
+        all_labels: list[list[int]] = []
+        all_prompt_ids: list[list[int]] = []
+
+        for example in examples:
+            messages = example[self.messages_key]
+
+            # Split: prompt = everything before the last assistant turn, completion = last assistant turn
+            has_completion = len(messages) > 1 and messages[-1].get("role") == "assistant"
+            prompt_messages = messages[:-1] if has_completion else messages
+
+            # Tokenize prompt with its own budget (truncate from the left to keep recent context)
+            formatted_prompt = self.tokenizer.apply_chat_template(
+                prompt_messages, tokenize=False, add_generation_prompt=True
+            )
+            prompt_ids = self.tokenizer(
+                formatted_prompt,
+                truncation=True,
+                max_length=self.max_prompt_length,
+                padding=False,
+                add_special_tokens=False,
+            )["input_ids"]
+
+            if has_completion:
+                # Tokenize the full message (prompt + completion) without truncation first
+                formatted_full = self.tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=False
+                )
+                full_ids = self.tokenizer(
+                    formatted_full, truncation=False, padding=False, add_special_tokens=False
+                )["input_ids"]
+
+                # Identify completion tokens: everything after the prompt in the full sequence.
+                # Use the un-truncated prompt length as the split point.
+                formatted_prompt_ids = self.tokenizer(
+                    formatted_prompt, truncation=False, padding=False, add_special_tokens=False
+                )["input_ids"]
+                completion_ids = full_ids[len(formatted_prompt_ids):]
+
+                # Trim completion so prompt + completion <= max_length
+                max_comp = self.max_length - len(prompt_ids)
+                if max_comp > 0 and len(completion_ids) > max_comp:
+                    completion_ids = completion_ids[:max_comp]
+                elif max_comp <= 0:
+                    completion_ids = []
+
+                input_ids = prompt_ids + completion_ids
+                labels = [self.ignore_index] * len(prompt_ids) + list(completion_ids)
+            else:
+                # Prompt-only: no completion to train on (on-policy will generate one)
+                input_ids = list(prompt_ids)
+                labels = [self.ignore_index] * len(prompt_ids)
+
+            all_input_ids.append(input_ids)
+            all_labels.append(labels)
+            all_prompt_ids.append(list(prompt_ids))
+
+        # Convert to tensors and left-pad
+        pad_id = self.tokenizer.pad_token_id
+        input_ids_t = pad(
+            [torch.tensor(ids, dtype=torch.long) for ids in all_input_ids],
+            padding_side="left", padding_value=pad_id,
+        )
+        attention_mask_t = pad(
+            [torch.ones(len(ids), dtype=torch.long) for ids in all_input_ids],
+            padding_side="left", padding_value=0,
+        )
+        labels_t = pad(
+            [torch.tensor(lab, dtype=torch.long) for lab in all_labels],
+            padding_side="left", padding_value=self.ignore_index,
+        )
+        prompts_t = pad(
+            [torch.tensor(ids, dtype=torch.long) for ids in all_prompt_ids],
+            padding_side="left", padding_value=pad_id,
+        )
+        prompt_mask_t = pad(
+            [torch.ones(len(ids), dtype=torch.long) for ids in all_prompt_ids],
+            padding_side="left", padding_value=0,
+        )
+
+        return {
+            "input_ids": input_ids_t,
+            "attention_mask": attention_mask_t,
+            "labels": labels_t,
+            "prompts": prompts_t,
+            "prompt_attention_mask": prompt_mask_t,
+        }
 
 
 class DistillationTrainer(_BaseTrainer):
@@ -178,7 +292,11 @@ class DistillationTrainer(_BaseTrainer):
 
         # ── Data collator ──
         if data_collator is None:
-            data_collator = DataCollatorForChatML(tokenizer=processing_class, max_length=args.max_length)
+            data_collator = _DistillationCollator(
+                tokenizer=processing_class,
+                max_length=args.max_length,
+                max_prompt_length=args.max_prompt_length,
+            )
 
         # ── Liger fused JSD loss ──
         self.use_liger_loss = False
@@ -224,7 +342,7 @@ class DistillationTrainer(_BaseTrainer):
                     init_kwargs["dtype"] = init_kwargs.pop("torch_dtype")
                 teacher_model = create_model_from_path(teacher_model, **init_kwargs)
 
-        # Trainer does not need to remove unused columns — DataCollatorForChatML handles raw data
+        # Trainer does not need to remove unused columns — the collator handles raw data
         args.remove_unused_columns = False
 
         # ── Call _BaseTrainer.__init__ (which is transformers.Trainer.__init__) ──
@@ -455,18 +573,22 @@ class DistillationTrainer(_BaseTrainer):
             self._generate_with_model(slices, on_policy_indices)
             return
 
-        # Collect all prompts across on-policy slices
+        # Collect all prompts across on-policy slices, stripping left-padding so vLLM
+        # receives only real prompt token IDs (like GRPO trainer).
         local_prompts = []
         local_slice_indices = []
+        pad_token_id = self.processing_class.pad_token_id
         for slice_idx in on_policy_indices:
-            for prompt in slices[slice_idx]["prompts"]:
+            prompt_mask = slices[slice_idx].get("prompt_attention_mask")
+            for i, prompt in enumerate(slices[slice_idx]["prompts"]):
+                if prompt_mask is not None:
+                    prompt = prompt[prompt_mask[i].bool()]
+                elif pad_token_id is not None:
+                    first_non_pad = (prompt != pad_token_id).nonzero(as_tuple=True)[0]
+                    if len(first_non_pad) > 0:
+                        prompt = prompt[first_non_pad[0] :]
                 local_prompts.append(prompt)
                 local_slice_indices.append(slice_idx)
-
-        prompts_text = self.processing_class.batch_decode(
-            torch.stack(local_prompts) if local_prompts else torch.empty(0, dtype=torch.long),
-            skip_special_tokens=False,
-        )
 
         # Sync student weights to vLLM if needed
         if (
@@ -476,7 +598,7 @@ class DistillationTrainer(_BaseTrainer):
             self.vllm_generation.sync_weights()
             self._last_vllm_sync_step = self.state.global_step
 
-        # Generate completions
+        # Generate completions — pass token IDs directly, no text decoding
         prompt_ids_list = [p.tolist() for p in local_prompts]
         _, completion_ids, _, _ = self.vllm_generation.generate(
             prompts=prompt_ids_list, images=None, num_generations=self.num_generations
@@ -484,7 +606,7 @@ class DistillationTrainer(_BaseTrainer):
 
         # Process completions into the buffer
         self._store_completions_in_buffer(
-            slices, on_policy_indices, local_slice_indices, completion_ids, prompts_text
+            slices, on_policy_indices, local_slice_indices, local_prompts, completion_ids
         )
 
     def _generate_with_model(self, slices: list[dict[str, torch.Tensor | Any]], on_policy_indices: list[int]):
@@ -543,39 +665,37 @@ class DistillationTrainer(_BaseTrainer):
         slices: list[dict[str, torch.Tensor | Any]],
         on_policy_indices: list[int],
         local_slice_indices: list[int],
+        local_prompts: list[torch.Tensor],
         completion_ids: list,
-        prompts_text: list[str],
     ):
-        """Process vLLM completions and store them in the buffer."""
+        """Process vLLM completions and store them in the buffer.
+
+        Uses original prompt token IDs directly (no decode/re-encode roundtrip), following the same
+        approach as GRPOTrainer.
+        """
         device = self.accelerator.device
         pad_token_id = self.processing_class.pad_token_id if self.processing_class.pad_token_id is not None else 0
         max_completion_length = self.generation_config.max_new_tokens
 
-        # Group completions by slice
+        # Group completions and prompt token IDs by slice
         slice_completions = {idx: [] for idx in on_policy_indices}
-        slice_prompts = {idx: [] for idx in on_policy_indices}
+        slice_prompt_ids = {idx: [] for idx in on_policy_indices}
         for i, slice_idx in enumerate(local_slice_indices):
             slice_completions[slice_idx].append(completion_ids[i])
-            slice_prompts[slice_idx].append(prompts_text[i])
+            slice_prompt_ids[slice_idx].append(local_prompts[i])
 
         for slice_idx in on_policy_indices:
             slice_inputs = slices[slice_idx]
-            prompt_txts = slice_prompts[slice_idx]
+            prompt_id_tensors = slice_prompt_ids[slice_idx]
 
-            # Tokenize prompts
-            prompt_max_length = max(1, self.args.max_length - max_completion_length) if self.args.max_length else None
-            prompt_tokenized = self.processing_class(
-                prompt_txts,
-                return_tensors="pt",
-                padding="longest",
-                padding_side="left",
-                truncation=True if prompt_max_length else False,
-                max_length=prompt_max_length,
-                add_special_tokens=False,
-            ).to(device)
-            prompt_ids = prompt_tokenized.input_ids
+            # Left-pad prompt token IDs to the longest prompt in this slice
+            max_prompt_len = max(len(p) for p in prompt_id_tensors)
+            prompt_ids = torch.stack([
+                F.pad(p, (max_prompt_len - len(p), 0), value=pad_token_id)
+                for p in prompt_id_tensors
+            ]).to(device)
 
-            # Pad/truncate completions
+            # Pad/truncate completions (right-pad to max_completion_length)
             completion_tensors = []
             completion_ids_for_text = []
             for comp_ids in slice_completions[slice_idx]:
@@ -595,6 +715,10 @@ class DistillationTrainer(_BaseTrainer):
             prompt_lengths = torch.full((prompt_ids.shape[0],), prompt_ids.shape[1], device=device)
             new_attention_mask, new_labels = self._build_sequence_batch(new_input_ids, prompt_lengths, pad_token_id)
 
+            # Decode for logging only
+            prompt_texts = self.processing_class.batch_decode(
+                prompt_id_tensors, skip_special_tokens=False, clean_up_tokenization_spaces=False
+            )
             completion_texts = self.processing_class.batch_decode(
                 completion_ids_for_text, skip_special_tokens=False, clean_up_tokenization_spaces=False
             )
@@ -603,9 +727,11 @@ class DistillationTrainer(_BaseTrainer):
             updated["input_ids"] = new_input_ids
             updated["attention_mask"] = new_attention_mask
             updated["labels"] = new_labels
+            # Update prompts to match the new padding width so prompt_length is consistent
+            updated["prompts"] = prompt_ids
 
             self._buffered_inputs[slice_idx] = updated
-            self._buffered_text_logs[slice_idx] = (prompt_txts, completion_texts)
+            self._buffered_text_logs[slice_idx] = (prompt_texts, completion_texts)
 
     @staticmethod
     def _build_sequence_batch(
@@ -730,16 +856,6 @@ class DistillationTrainer(_BaseTrainer):
 
         return loss.mean()
 
-    def _get_prompt_length(self, inputs: dict[str, torch.Tensor | Any]) -> int:
-        """Compute the effective prompt length from labels and attention mask."""
-        labels = inputs.get("labels")
-        attention_mask = inputs.get("attention_mask")
-        if labels is not None and attention_mask is not None:
-            total_valid = attention_mask.sum(dim=1)
-            completion_len = (labels != -100).sum(dim=1)
-            return int((total_valid - completion_len).min().item())
-        return inputs["prompts"].shape[1]
-
     def _get_teacher_logits(self, inputs: dict[str, torch.Tensor | Any]) -> torch.Tensor:
         """Get teacher logits — dispatches between local model and external server."""
         if self.teacher_model is not None:
@@ -763,7 +879,7 @@ class DistillationTrainer(_BaseTrainer):
         input_ids = inputs["input_ids"]
         attention_mask = inputs["attention_mask"]
         batch_size = input_ids.shape[0]
-        prompt_length = self._get_prompt_length(inputs)
+        prompt_length = inputs["prompts"].shape[1]
 
         # Extract unpadded sequences
         sequences = []
@@ -805,7 +921,7 @@ class DistillationTrainer(_BaseTrainer):
             input_ids=inputs["input_ids"],
             attention_mask=inputs["attention_mask"],
         )
-        prompt_length = self._get_prompt_length(inputs)
+        prompt_length = inputs["prompts"].shape[1]
         labels = inputs["labels"][:, prompt_length:]
 
         if self.teacher_client is not None:
