@@ -949,7 +949,7 @@ class GOLDTrainer(SFTTrainer):
                 server_timeout=args.vllm_server_timeout,
                 tensor_parallel_size=args.vllm_tensor_parallel_size,
                 gpu_memory_utilization=args.vllm_gpu_memory_utilization,
-                max_model_length=args.vllm_max_model_length,
+                max_model_length=args.vllm_max_model_length or args.max_length,
                 max_num_seqs=args.per_device_train_batch_size * args.gradient_accumulation_steps,
                 enable_sleep_mode=args.vllm_enable_sleep_mode,
                 model_impl=args.vllm_model_impl,
@@ -962,7 +962,7 @@ class GOLDTrainer(SFTTrainer):
                 logprobs=None,
             )
             self.vllm_sync_frequency = args.vllm_sync_frequency
-            self._last_vllm_sync_step = -1
+            self._last_vllm_sync_step = -self.vllm_sync_frequency
 
     def _set_signature_columns_if_needed(self):
         super()._set_signature_columns_if_needed()
@@ -1159,10 +1159,19 @@ class GOLDTrainer(SFTTrainer):
                 local_prompts.append(prompt)
                 local_slice_indices.append(slice_idx)
 
+        stacked_prompts = torch.stack(local_prompts) if local_prompts else torch.empty(0, dtype=torch.long)
+
         prompts_text_with_special = self.processing_class.batch_decode(
-            torch.stack(local_prompts) if local_prompts else torch.empty(0, dtype=torch.long),
+            stacked_prompts,
             skip_special_tokens=False,
         )
+
+        prompts_text = self.processing_class.batch_decode(
+            stacked_prompts,
+            skip_special_tokens=True,
+        )
+        if self.processing_class.pad_token:
+            prompts_text = [p.replace(self.processing_class.pad_token, "") for p in prompts_text]
 
         if not self.use_vllm:
             self._generate_non_vllm_for_slices(slices, on_policy_indices)
@@ -1170,12 +1179,13 @@ class GOLDTrainer(SFTTrainer):
 
         if (
             self.state.global_step != self._last_vllm_sync_step
-            and self.state.global_step % self.vllm_sync_frequency == 0
+            and self.state.global_step >= self._last_vllm_sync_step + self.vllm_sync_frequency
         ):
             self.vllm_generation.sync_weights()
             self._last_vllm_sync_step = self.state.global_step
 
-        prompt_ids_list = [p.tolist() for p in local_prompts]
+        pad_token_id = self.processing_class.pad_token_id
+        prompt_ids_list = [[tok for tok in p.tolist() if tok != pad_token_id] for p in local_prompts]
         _, completion_ids, _, _ = self.vllm_generation.generate(
             prompts=prompt_ids_list,
             images=None,
@@ -1187,7 +1197,7 @@ class GOLDTrainer(SFTTrainer):
             on_policy_indices,
             local_slice_indices,
             completion_ids,
-            prompts_text_with_special,
+            prompts_text,
             prompts_text_with_special,
             self.generation_config.max_new_tokens,
         )
