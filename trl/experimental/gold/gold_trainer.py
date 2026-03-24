@@ -1095,20 +1095,26 @@ class GOLDTrainer(SFTTrainer):
 
     @staticmethod
     def _build_sequence_batch(
-        new_input_ids: torch.Tensor, prompt_lengths: torch.Tensor, pad_token_id: int | None
+        new_input_ids: torch.Tensor,
+        prompt_lengths: torch.Tensor,
+        pad_token_id: int | None,
+        attention_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Build attention mask and labels from full sequences and prompt lengths."""
         prompt_lengths = prompt_lengths.to(device=new_input_ids.device, dtype=torch.long)
         positions = torch.arange(new_input_ids.shape[1], device=new_input_ids.device).unsqueeze(0)
         completion_mask = positions >= prompt_lengths.unsqueeze(1)
 
-        new_attention_mask = torch.ones_like(new_input_ids)
-        if pad_token_id is not None:
-            new_attention_mask[new_input_ids == pad_token_id] = 0
+        if attention_mask is not None:
+            new_attention_mask = attention_mask.to(device=new_input_ids.device, dtype=new_input_ids.dtype)
+        else:
+            new_attention_mask = torch.ones_like(new_input_ids)
+            if pad_token_id is not None:
+                new_attention_mask[new_input_ids == pad_token_id] = 0
 
         new_labels = torch.full_like(new_input_ids, -100)
-        new_labels[completion_mask] = new_input_ids[completion_mask]
-        if pad_token_id is not None:
+        new_labels[completion_mask & new_attention_mask.bool()] = new_input_ids[completion_mask & new_attention_mask.bool()]
+        if attention_mask is None and pad_token_id is not None:
             new_labels[new_input_ids == pad_token_id] = -100
 
         return new_attention_mask, new_labels
@@ -1151,27 +1157,25 @@ class GOLDTrainer(SFTTrainer):
     def _generate_on_policy_for_slices(
         self, slices: list[dict[str, torch.Tensor | Any]], on_policy_indices: list[int]
     ):
-        local_prompts = []
+        prompt_ids_list = []
         local_slice_indices = []
         for slice_idx in on_policy_indices:
             slice_inputs = slices[slice_idx]
-            for prompt in slice_inputs["prompts"]:
-                local_prompts.append(prompt)
+            prompt_attention_mask = slice_inputs.get("prompt_attention_mask")
+            for prompt_idx, prompt in enumerate(slice_inputs["prompts"]):
+                if prompt_attention_mask is not None:
+                    prompt = prompt[prompt_attention_mask[prompt_idx].bool()]
+                prompt_ids_list.append(prompt.tolist())
                 local_slice_indices.append(slice_idx)
 
-        stacked_prompts = torch.stack(local_prompts) if local_prompts else torch.empty(0, dtype=torch.long)
-
-        prompts_text_with_special = self.processing_class.batch_decode(
-            stacked_prompts,
-            skip_special_tokens=False,
-        )
-
         prompts_text = self.processing_class.batch_decode(
-            stacked_prompts,
+            prompt_ids_list,
             skip_special_tokens=True,
         )
-        if self.processing_class.pad_token:
-            prompts_text = [p.replace(self.processing_class.pad_token, "") for p in prompts_text]
+        prompts_text_with_special = self.processing_class.batch_decode(
+            prompt_ids_list,
+            skip_special_tokens=False,
+        )
 
         if not self.use_vllm:
             self._generate_non_vllm_for_slices(slices, on_policy_indices)
@@ -1184,8 +1188,6 @@ class GOLDTrainer(SFTTrainer):
             self.vllm_generation.sync_weights()
             self._last_vllm_sync_step = self.state.global_step
 
-        pad_token_id = self.processing_class.pad_token_id
-        prompt_ids_list = [[tok for tok in p.tolist() if tok != pad_token_id] for p in local_prompts]
         _, completion_ids, _, _ = self.vllm_generation.generate(
             prompts=prompt_ids_list,
             images=None,
@@ -1197,8 +1199,9 @@ class GOLDTrainer(SFTTrainer):
             on_policy_indices,
             local_slice_indices,
             completion_ids,
-            prompts_text,
+            prompt_ids_list,
             prompts_text_with_special,
+            prompts_text,
             self.generation_config.max_new_tokens,
         )
 
@@ -1235,8 +1238,9 @@ class GOLDTrainer(SFTTrainer):
         on_policy_indices: list[int],
         local_slice_indices: list[int],
         completion_ids: list,
-        prompts_text: list[str],
+        prompt_ids_list: list[list[int]],
         prompts_text_with_special: list[str],
+        prompts_text: list[str],
         max_completion_length: int,
     ):
         """
@@ -1246,40 +1250,50 @@ class GOLDTrainer(SFTTrainer):
         pad_token_id = self.processing_class.pad_token_id if self.processing_class.pad_token_id is not None else 0
 
         slice_completions = {idx: [] for idx in on_policy_indices}
+        slice_prompt_ids = {idx: [] for idx in on_policy_indices}
         slice_prompts = {idx: [] for idx in on_policy_indices}
         slice_prompts_special = {idx: [] for idx in on_policy_indices}
 
         for i, slice_idx in enumerate(local_slice_indices):
             slice_completions[slice_idx].append(completion_ids[i])
-            slice_prompts[slice_idx].append(prompts_text[i])
+            slice_prompt_ids[slice_idx].append(prompt_ids_list[i])
             slice_prompts_special[slice_idx].append(prompts_text_with_special[i])
+            slice_prompts[slice_idx].append(prompts_text[i])
 
         for slice_idx in on_policy_indices:
             slice_inputs = slices[slice_idx]
             completion_ids_for_slice = slice_completions[slice_idx]
+            prompt_ids_for_slice = slice_prompt_ids[slice_idx]
             prompt_txts = slice_prompts[slice_idx]
             prompt_txts_with_special = slice_prompts_special[slice_idx]
 
             prompt_max_length = max(1, self.args.max_length - max_completion_length) if self.args.max_length else None
-            prompt_tokenized = self.processing_class(
-                prompt_txts,
-                return_tensors="pt",
-                padding="longest",
-                padding_side="left",
-                truncation=True if prompt_max_length else False,
-                max_length=prompt_max_length,
-                add_special_tokens=False,
-            ).to(device)
-            prompt_ids = prompt_tokenized.input_ids
+            truncated_prompt_ids = []
+            prompt_attention_masks = []
+            truncation_side = getattr(self.processing_class, "truncation_side", "right")
+            for prompt_ids in prompt_ids_for_slice:
+                if prompt_max_length and len(prompt_ids) > prompt_max_length:
+                    if truncation_side == "left":
+                        prompt_ids = prompt_ids[-prompt_max_length:]
+                    else:
+                        prompt_ids = prompt_ids[:prompt_max_length]
+                prompt_tensor = torch.tensor(prompt_ids, device=device, dtype=torch.long)
+                truncated_prompt_ids.append(prompt_tensor)
+                prompt_attention_masks.append(torch.ones(len(prompt_ids), device=device, dtype=torch.long))
+
+            prompt_ids = pad(truncated_prompt_ids, padding_side="left", padding_value=pad_token_id)
+            prompt_attention_mask = pad(prompt_attention_masks, padding_side="left", padding_value=0)
 
             completion_ids_tensors = [torch.tensor(ids, device=device) for ids in completion_ids_for_slice]
             completion_ids_for_text: list[list[int]] = []
             padded_completion_ids_list = []
+            completion_attention_masks = []
             for completion_tensor in completion_ids_tensors:
                 if len(completion_tensor) > max_completion_length:
                     truncated_completion_tensor = completion_tensor[:max_completion_length]
                     padded_completion_ids_list.append(truncated_completion_tensor)
                     completion_ids_for_text.append(truncated_completion_tensor.tolist())
+                    completion_attention_masks.append(torch.ones(len(truncated_completion_tensor), device=device, dtype=torch.long))
                 elif len(completion_tensor) < max_completion_length:
                     padding_needed = max_completion_length - len(completion_tensor)
                     padded_tensor = torch.cat(
@@ -1295,15 +1309,31 @@ class GOLDTrainer(SFTTrainer):
                     )
                     padded_completion_ids_list.append(padded_tensor)
                     completion_ids_for_text.append(completion_tensor.tolist())
+                    completion_attention_masks.append(
+                        torch.cat(
+                            [
+                                torch.ones(len(completion_tensor), device=device, dtype=torch.long),
+                                torch.zeros(padding_needed, device=device, dtype=torch.long),
+                            ]
+                        )
+                    )
                 else:
                     padded_completion_ids_list.append(completion_tensor)
                     completion_ids_for_text.append(completion_tensor.tolist())
+                    completion_attention_masks.append(torch.ones(len(completion_tensor), device=device, dtype=torch.long))
 
             completion_ids_padded = torch.stack(padded_completion_ids_list)
+            completion_attention_mask = torch.stack(completion_attention_masks)
 
             new_input_ids = torch.cat([prompt_ids, completion_ids_padded], dim=1)
+            new_attention_mask = torch.cat([prompt_attention_mask, completion_attention_mask], dim=1)
             prompt_lengths = torch.full((prompt_ids.shape[0],), prompt_ids.shape[1], device=device)
-            new_attention_mask, new_labels = self._build_sequence_batch(new_input_ids, prompt_lengths, pad_token_id)
+            new_attention_mask, new_labels = self._build_sequence_batch(
+                new_input_ids,
+                prompt_lengths,
+                pad_token_id,
+                attention_mask=new_attention_mask,
+            )
 
             completion_texts = self.processing_class.batch_decode(
                 completion_ids_for_text,
