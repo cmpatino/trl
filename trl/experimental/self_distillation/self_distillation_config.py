@@ -165,8 +165,8 @@ class SelfDistillationConfig(_BaseConfig):
         metadata={"help": "vLLM mode: 'colocate' (shared GPU) or 'server' (separate vLLM server)."},
     )
     vllm_model_impl: str = field(
-        default="auto",
-        metadata={"help": "Model implementation for vLLM: 'auto', 'vllm', or 'transformers'."},
+        default="vllm",
+        metadata={"help": "Model implementation for vLLM: 'vllm' or 'transformers'."},
     )
     vllm_enable_sleep_mode: bool = field(
         default=False,
