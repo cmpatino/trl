@@ -15,7 +15,7 @@
 import random
 import textwrap
 import warnings
-from collections import defaultdict, deque
+from collections import defaultdict
 from collections.abc import Callable
 from contextlib import nullcontext
 from functools import partial
@@ -215,6 +215,35 @@ class _DistillationCollator:
             "prompts": prompts_t,
             "prompt_attention_mask": prompt_mask_t,
         }
+
+
+class _RepeatBatchDataLoader:
+    """Repeats each collated batch ``repeat_count`` times without re-collation.
+
+    ``RepeatSampler`` with ``repeat_count > 1`` causes the DataLoader to re-collate
+    (re-tokenize) the same examples on every repeat, which is wasteful.  This wrapper
+    instead keeps ``repeat_count=1`` in the sampler and repeats the already-collated
+    tensor dict, avoiding redundant tokenization.
+    """
+
+    def __init__(self, dataloader, repeat_count: int):
+        self.dataloader = dataloader
+        self.repeat_count = repeat_count
+
+    def __iter__(self):
+        for batch in self.dataloader:
+            for _ in range(self.repeat_count):
+                yield batch
+
+    def __len__(self):
+        return len(self.dataloader) * self.repeat_count
+
+    def set_epoch(self, epoch: int):
+        if hasattr(self.dataloader, "set_epoch"):
+            self.dataloader.set_epoch(epoch)
+
+    def __getattr__(self, attr):
+        return getattr(self.dataloader, attr)
 
 
 class DistillationTrainer(_BaseTrainer):
@@ -456,10 +485,9 @@ class DistillationTrainer(_BaseTrainer):
         self.log_completions_steps = args.log_completions_steps
         self.num_completions_to_print = args.num_completions_to_print
 
-        maxlen = self.accelerator.num_processes * args.per_device_train_batch_size * args.gradient_accumulation_steps
         self._textual_logs = {
-            "prompt": deque(maxlen=maxlen),
-            "completion": deque(maxlen=maxlen),
+            "prompt": [],
+            "completion": [],
         }
 
         # ── vLLM for student generation ──
@@ -566,7 +594,7 @@ class DistillationTrainer(_BaseTrainer):
             data_source=dataset,
             mini_repeat_count=self.num_generations,
             batch_size=self.args.generation_batch_size * self.accelerator.num_processes,
-            repeat_count=self.args.gradient_accumulation_steps,
+            repeat_count=1,
             shuffle=True,
             seed=self.args.seed,
         )
@@ -604,7 +632,8 @@ class DistillationTrainer(_BaseTrainer):
             if self.args.dataloader_num_workers > 0:
                 dataloader_params["prefetch_factor"] = self.args.dataloader_prefetch_factor
 
-        return self.accelerator.prepare(DataLoader(train_dataset, **dataloader_params))
+        base_dataloader = self.accelerator.prepare(DataLoader(train_dataset, **dataloader_params))
+        return _RepeatBatchDataLoader(base_dataloader, repeat_count=self.args.gradient_accumulation_steps)
 
     # ──────────────────────────────────────────────────────────────────────
     #  Buffering: on/off-policy mixing across gradient accumulation steps
@@ -651,6 +680,18 @@ class DistillationTrainer(_BaseTrainer):
         # Generate student completions for on-policy slices
         if on_policy_indices:
             self._generate_student_completions(slices, on_policy_indices)
+
+        # Gather on-policy text logs once per optimizer step (all processes must participate)
+        if self.log_completions:
+            on_policy_prompts = []
+            on_policy_completions = []
+            for i in on_policy_indices:
+                if self._buffered_text_logs[i] is not None:
+                    prompts, completions = self._buffered_text_logs[i]
+                    on_policy_prompts.extend(prompts)
+                    on_policy_completions.extend(completions)
+            self._textual_logs["prompt"].extend(gather_object(on_policy_prompts))
+            self._textual_logs["completion"].extend(gather_object(on_policy_completions))
 
     @profiling_decorator
     def _generate_student_completions(
@@ -978,12 +1019,20 @@ class DistillationTrainer(_BaseTrainer):
         else:
             raise ValueError("No teacher model or teacher server configured.")
 
-    def _get_teacher_token_logprobs_from_server(self, inputs: dict[str, torch.Tensor | Any]) -> torch.Tensor:
+    def _get_teacher_token_logprobs_from_server(
+        self, inputs: dict[str, torch.Tensor | Any]
+    ) -> dict[str, torch.Tensor]:
         """Fetch per-token teacher logprobs from an external vLLM server.
 
-        Returns a tensor of shape (batch_size, completion_length) containing the teacher's log-probability
-        for the token present at each completion position in the input sequence.
+        Returns a dict with:
+            ``actual_logprobs``  – (batch, completion_length) teacher log-prob for the actual
+                                   token at each position (for reverse KL).
+            ``topk_logprobs``    – (batch, completion_length, K) teacher top-k sorted logprobs
+                                   (for forward KL).
+            ``topk_token_ids``   – (batch, completion_length, K) corresponding token IDs.
         """
+        import numpy as np
+
         input_ids = inputs["input_ids"]
         attention_mask = inputs["attention_mask"]
         batch_size = input_ids.shape[0]
@@ -998,26 +1047,90 @@ class DistillationTrainer(_BaseTrainer):
             sequences.append(seq)
             prompt_lengths.append(prompt_length)
 
-        # Request top-1 logprobs from the teacher server. The server returns the logprob of the token at each
-        # position (i.e., the token in the sequence we sent), which is exactly what we need for all divergences.
+        K = self.teacher_server_top_logprobs
         result = self.teacher_client.get_sequence_logprobs(
             sequences=sequences,
             prompt_lengths=prompt_lengths,
-            top_logprobs=1,
+            top_logprobs=K,
         )
 
-        # Build a (batch_size, completion_length) tensor of teacher logprobs for the sequence tokens
-        completion_length = max(len(lps) for lps in result["logprobs"])
         device = input_ids.device
-        teacher_logprobs = torch.full(
-            (batch_size, completion_length), float("-inf"), dtype=torch.float32, device=device
-        )
-        for i, seq_lps in enumerate(result["logprobs"]):
-            for pos, lps in enumerate(seq_lps):
-                if lps and lps[0] is not None:
-                    teacher_logprobs[i, pos] = lps[0]
+        completion_length = max(len(lps) for lps in result["logprobs"])
 
-        return teacher_logprobs
+        # actual_logprobs: (B, T) — teacher logprob for the actual token
+        def _actual_to_tensor(key):
+            arr = np.full((batch_size, completion_length), float("-inf"), dtype=np.float32)
+            for i, seq_lps in enumerate(result[key]):
+                if seq_lps:
+                    vals = np.array(seq_lps, dtype=np.float32)  # (comp_len_i, 1)
+                    arr[i, : vals.shape[0]] = vals[:, 0]
+            return torch.from_numpy(arr).to(device)
+
+        # topk: (B, T, K)
+        def _topk_to_tensor(key, k, np_dtype, fill):
+            arr = np.full((batch_size, completion_length, k), fill, dtype=np_dtype)
+            for i, seq_vals in enumerate(result[key]):
+                if seq_vals:
+                    vals = np.array(seq_vals, dtype=np_dtype)  # (comp_len_i, k)
+                    arr[i, : vals.shape[0], :] = vals
+            return torch.from_numpy(arr).to(device)
+
+        return {
+            "actual_logprobs": _actual_to_tensor("actual_logprobs"),
+            "topk_logprobs": _topk_to_tensor("logprobs", K, np.float32, float("-inf")),
+            "topk_token_ids": _topk_to_tensor("logprob_token_ids", K, np.int64, 0),
+        }
+
+    def _compute_server_divergence_loss(
+        self,
+        teacher_result: dict[str, torch.Tensor],
+        student_log_probs: torch.Tensor,
+        completion_tokens: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute forward/reverse KL or JSD using teacher logprobs from the server.
+
+        The forward KL term sums over the teacher's top-k tokens (better approximation
+        as k increases).  The reverse KL term always uses the actual (student-sampled)
+        token only, because the teacher's top-k may not cover the student's high-probability
+        tokens.
+
+        Args:
+            teacher_result: dict with ``actual_logprobs`` (B, T), ``topk_logprobs`` (B, T, K),
+                ``topk_token_ids`` (B, T, K).
+            student_log_probs: (B, T, V) student log-softmax over vocabulary.
+            completion_tokens: (B, T) actual token IDs in the completion.
+            labels: (B, T) with -100 for positions to ignore.
+        """
+        topk_teacher_lps = teacher_result["topk_logprobs"]   # (B, T, K)
+        topk_token_ids = teacher_result["topk_token_ids"]     # (B, T, K)
+        actual_teacher_lps = teacher_result["actual_logprobs"]  # (B, T)
+
+        # ── Forward KL term: sum over teacher's top-k tokens ──
+        # Gather student logprobs for each of the teacher's top-k tokens.
+        student_topk_lps = student_log_probs.gather(dim=-1, index=topk_token_ids)  # (B, T, K)
+
+        # Mask out -inf padding (positions where top-k slot was not filled).
+        valid = topk_teacher_lps > float("-inf")
+        fwd_per_k = torch.exp(topk_teacher_lps) * (topk_teacher_lps - student_topk_lps)  # (B, T, K)
+        fwd_per_token = (fwd_per_k * valid).sum(dim=-1)  # (B, T)
+
+        # ── Reverse KL term: actual token only ──
+        student_actual_lps = student_log_probs.gather(
+            dim=-1, index=completion_tokens.unsqueeze(-1)
+        ).squeeze(-1)  # (B, T)
+        rev_per_token = torch.exp(student_actual_lps) * (student_actual_lps - actual_teacher_lps)  # (B, T)
+
+        # ── Combine according to beta ──
+        if self.beta == 0:
+            loss_per_token = fwd_per_token
+        elif self.beta == 1:
+            loss_per_token = rev_per_token
+        else:
+            loss_per_token = self.beta * fwd_per_token + (1 - self.beta) * rev_per_token
+
+        mask = labels != -100
+        return loss_per_token[mask].sum() / mask.sum()
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         self._raise_if_local_teacher_tokenizer_mismatch()
@@ -1035,25 +1148,26 @@ class DistillationTrainer(_BaseTrainer):
         labels = inputs["labels"][:, prompt_length:]
 
         if self.teacher_client is not None:
-            # Server path: token-level divergence using top-1 logprobs
-            teacher_token_logprobs = self._get_teacher_token_logprobs_from_server(inputs)
+            # Server path: token-level divergence using teacher logprobs.
+            # The server returns:
+            #   actual_logprobs  – (B, T)    teacher log p(x_actual)  (for reverse KL)
+            #   topk_logprobs    – (B, T, K) teacher top-k sorted logprobs (for forward KL)
+            #   topk_token_ids   – (B, T, K) corresponding token IDs
+            teacher_result = self._get_teacher_token_logprobs_from_server(inputs)
 
-            # Extract student logprobs for the same tokens in the completion region
             student_logits = student_outputs.logits[:, prompt_length - 1 : -1, :]
             student_log_probs = F.log_softmax(student_logits / self.temperature, dim=-1)
             completion_tokens = inputs["input_ids"][:, prompt_length:]
-            # Trim to match completion length from server
-            comp_len = teacher_token_logprobs.shape[1]
-            completion_tokens = completion_tokens[:, :comp_len]
-            student_token_logprobs = student_log_probs[:, :comp_len, :].gather(
-                dim=-1, index=completion_tokens.unsqueeze(-1)
-            ).squeeze(-1)
 
-            loss = self.token_level_divergence_loss(
-                student_logprobs=student_token_logprobs,
-                teacher_logprobs=teacher_token_logprobs,
-                labels=labels[:, :comp_len],
-                beta=self.beta,
+            comp_len = teacher_result["actual_logprobs"].shape[1]
+            completion_tokens = completion_tokens[:, :comp_len]
+            trimmed_labels = labels[:, :comp_len]
+
+            loss = self._compute_server_divergence_loss(
+                teacher_result=teacher_result,
+                student_log_probs=student_log_probs[:, :comp_len, :],
+                completion_tokens=completion_tokens,
+                labels=trimmed_labels,
             )
         else:
             # Local teacher: full-vocabulary generalized JSD
@@ -1169,18 +1283,14 @@ class DistillationTrainer(_BaseTrainer):
 
         slice_idx = (self._buffer_step - 1) % buffer_steps
 
-        # Track on-policy text logs
+        # Determine if this slice is on-policy
         is_on_policy = False
         if self._buffered_on_policy_flags is not None and slice_idx < len(self._buffered_on_policy_flags):
             is_on_policy = self._buffered_on_policy_flags[slice_idx]
 
-        if is_on_policy and self._buffered_text_logs is not None and self._buffered_text_logs[slice_idx] is not None:
-            prompt_texts, completion_texts = self._buffered_text_logs[slice_idx]
-            self._textual_logs["prompt"].extend(gather_object(prompt_texts))
-            self._textual_logs["completion"].extend(gather_object(completion_texts))
-
-        # Track completion length stats
-        labels = inputs.get("labels")
+        # Track completion length stats — read from buffered inputs (which reflect on-policy generation)
+        actual_inputs = self._buffered_inputs[slice_idx] if self._buffered_inputs is not None else inputs
+        labels = actual_inputs.get("labels")
         if labels is not None:
             completion_lengths = (labels != -100).sum(dim=1).float()
             gathered_lengths = self.accelerator.gather(completion_lengths)
@@ -1244,32 +1354,42 @@ class DistillationTrainer(_BaseTrainer):
         self._metrics[mode].clear()
 
         # Log completions to console and wandb
-        if (
-            self.accelerator.is_main_process
-            and self.log_completions
+        should_log_completions = (
+            self.log_completions
+            and self.state.global_step > 0
             and self.state.global_step % self.log_completions_steps == 0
-        ):
+        )
+
+        if should_log_completions and self.accelerator.is_main_process:
             prompts = list(self._textual_logs["prompt"])
             completions = list(self._textual_logs["completion"])
 
-            _print_completions_sample(prompts, completions, self.state.global_step, self.num_completions_to_print)
+            if prompts:
+                _print_completions_sample(
+                    prompts, completions, self.state.global_step, self.num_completions_to_print
+                )
 
-            # Log as a wandb Table
-            if self.args.report_to and "wandb" in self.args.report_to:
-                try:
-                    import wandb
+                # Log as a wandb Table
+                if self.args.report_to and "wandb" in self.args.report_to:
+                    try:
+                        import wandb
 
-                    if wandb.run is not None:
-                        import pandas as pd
+                        if wandb.run is not None:
+                            import pandas as pd
 
-                        table_data = {
-                            "step": [str(self.state.global_step)] * len(prompts),
-                            "prompt": prompts,
-                            "completion": completions,
-                        }
-                        df = pd.DataFrame(table_data)
-                        if self.num_completions_to_print and len(df) > self.num_completions_to_print:
-                            df = df.sample(n=self.num_completions_to_print, random_state=42)
-                        wandb.log({"completions": wandb.Table(dataframe=df)})
-                except ImportError:
-                    pass
+                            table_data = {
+                                "step": [str(self.state.global_step)] * len(prompts),
+                                "prompt": prompts,
+                                "completion": completions,
+                            }
+                            df = pd.DataFrame(table_data)
+                            if self.num_completions_to_print and len(df) > self.num_completions_to_print:
+                                df = df.sample(n=self.num_completions_to_print, random_state=42)
+                            wandb.log({"completions": wandb.Table(dataframe=df)})
+                    except ImportError:
+                        pass
+
+        # Clear text logs on all processes after the logging interval
+        if should_log_completions:
+            self._textual_logs["prompt"].clear()
+            self._textual_logs["completion"].clear()

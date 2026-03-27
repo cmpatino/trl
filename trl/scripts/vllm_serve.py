@@ -441,6 +441,8 @@ def main(script_args: ScriptArguments):
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        import asyncio as _asyncio
+
         # Wait for all workers to send "ready"
         ready_connections = set()
         while len(ready_connections) < script_args.data_parallel_size:
@@ -449,7 +451,12 @@ def main(script_args: ScriptArguments):
                 if isinstance(msg, dict) and msg.get("status") == "ready":
                     ready_connections.add(connection)
 
+        # Start the logprob request batcher background task
+        batcher_task = _asyncio.create_task(_logprob_batcher())
+
         yield
+
+        batcher_task.cancel()
 
         # Wait for processes to terminate
         for process in processes:
@@ -646,82 +653,273 @@ def main(script_args: ScriptArguments):
         sequences: list[list[int]]
         prompt_lengths: list[int]
         top_logprobs: int = 100
+        response_format: str = "json"  # "json" (legacy) or "binary" (base64 numpy arrays)
 
     class SequenceLogprobsResponse(BaseModel):
-        logprobs: list[list[list[float | None]]]
-        logprob_token_ids: list[list[list[int]]]
+        logprobs: list[list[list[float | None]]] | None = None
+        logprob_token_ids: list[list[list[int]]] | None = None
+        # Binary format fields (base64-encoded numpy arrays)
+        logprobs_b64: str | None = None
+        token_ids_b64: str | None = None
+        shape: list[int] | None = None  # [batch_size, max_completion_len, top_logprobs]
+        completion_lengths: list[int] | None = None  # actual completion length per sample
 
-    @app.post("/get_sequence_logprobs/", response_model=SequenceLogprobsResponse)
-    async def get_sequence_logprobs(request: SequenceLogprobsRequest):
-        """
-        Computes teacher logprobs for existing token sequences without generating new tokens.
-
-        Sends the full sequence (prompt + completion) as the vLLM prompt with `max_tokens=1` and
-        `prompt_logprobs=top_logprobs`. Returns logprobs only for the completion region (positions
-        from `prompt_length` onwards) for each sequence.
-
-        Args:
-            request (`SequenceLogprobsRequest`):
-                - `sequences` (list of list of `int`): Full token ID sequences (prompt + completion).
-                - `prompt_lengths` (list of `int`): Number of prompt tokens in each sequence. Logprobs
-                  are returned starting from this position.
-                - `top_logprobs` (`int`, *optional*, defaults to `100`): Number of top logprobs per position.
-
-        Returns:
-            `SequenceLogprobsResponse`:
-                - `logprobs` (list of list of list of `float`): Per-token logprobs of shape
-                  (batch, completion_len, top_logprobs), sorted by descending probability.
-                - `logprob_token_ids` (list of list of list of `int`): Token IDs corresponding to each
-                  logprob, same shape as `logprobs`.
-        """
-        if len(request.sequences) != len(request.prompt_lengths):
-            raise ValueError("sequences and prompt_lengths must have the same length.")
-
-        prompts = [{"prompt_token_ids": seq} for seq in request.sequences]
-        sampling_params = SamplingParams(
-            max_tokens=1,
-            temperature=1.0,
-            prompt_logprobs=request.top_logprobs,
-        )
-
+    def _run_prompt_logprobs(prompts, sampling_params):
+        """Send prompts to DP workers and collect outputs."""
         chunked_prompts = chunk_list(prompts, script_args.data_parallel_size)
-
         for connection, chunk in zip(connections, chunked_prompts, strict=True):
             if not chunk:
                 chunk = [{"prompt_token_ids": [0]}]
             kwargs = {"prompts": chunk, "sampling_params": sampling_params}
             connection.send({"type": "call", "method": "generate", "kwargs": kwargs})
-
         all_outputs = [connection.recv() for connection in connections]
         all_outputs = [output for output, chunk in zip(all_outputs, chunked_prompts, strict=True) if chunk]
-        all_outputs = list(chain.from_iterable(all_outputs))
+        return list(chain.from_iterable(all_outputs))
 
-        all_logprobs = []
-        all_token_ids = []
-        for output, prompt_length in zip(all_outputs, request.prompt_lengths, strict=True):
-            # prompt_logprobs is a list of dicts, one per prompt token (first token is None)
-            prompt_lps = output.prompt_logprobs
-            if prompt_lps is None:
-                raise ValueError("prompt_logprobs is None. Ensure the vLLM server supports prompt_logprobs.")
+    # ── Request batching for get_sequence_logprobs ──
+    # Collects concurrent requests into batches and dispatches them together so that
+    # all DP workers stay busy. Without this, async endpoint handlers block the event
+    # loop during pipe I/O, serializing requests and leaving DP workers idle.
+    import asyncio
+    import threading
 
-            seq_logprobs = []
-            seq_token_ids = []
-            # Extract logprobs only for the completion region
-            for pos in range(prompt_length, len(prompt_lps)):
-                lp = prompt_lps[pos]
-                if lp is None:
-                    seq_logprobs.append([])
-                    seq_token_ids.append([])
-                    continue
-                sorted_items = sorted(lp.items(), key=lambda x: x[1].rank)
-                seq_token_ids.append([token_id for token_id, _ in sorted_items])
-                seq_logprobs.append(
-                    [None if math.isnan(item.logprob) else item.logprob for _, item in sorted_items]
+    _logprob_queue: asyncio.Queue = asyncio.Queue()
+
+    # Maximum time (seconds) to wait for more requests before dispatching a batch.
+    _BATCH_WAIT_S = 0.005  # 5ms - short enough to not add much latency when lightly loaded
+    # Maximum number of sequences per batch (set to DP size so each worker gets sequences)
+    _MAX_BATCH_SEQS = max(script_args.data_parallel_size * 4, 16)
+    # Maximum total tokens per batch. prompt_logprobs materializes full-vocab logits
+    # during the forward pass, so each worker can safely handle ~1 max-length sequence.
+    # Budget = max_model_len * dp_size gives ~1 sequence per worker at max length.
+    _max_model_len = script_args.max_model_len or 8192
+    _MAX_BATCH_TOKENS = _max_model_len * script_args.data_parallel_size
+
+    async def _logprob_batcher():
+        """Background task that continuously drains the queue, batches requests, and dispatches."""
+        loop = asyncio.get_event_loop()
+
+        while True:
+            # Wait for the first request
+            batch = []
+            batch_tokens = 0
+            item = await _logprob_queue.get()
+            batch.append(item)
+            # Count tokens in this item's sequences
+            for prompt in item[0]:
+                batch_tokens += len(prompt.get("prompt_token_ids", []))
+
+            # Collect more requests up to batch limit, timeout, or token budget
+            deadline = loop.time() + _BATCH_WAIT_S
+            while len(batch) < _MAX_BATCH_SEQS and batch_tokens < _MAX_BATCH_TOKENS:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    break
+                try:
+                    item = await asyncio.wait_for(_logprob_queue.get(), timeout=remaining)
+                    # Check if adding this item would exceed the token budget
+                    item_tokens = sum(len(p.get("prompt_token_ids", [])) for p in item[0])
+                    if batch_tokens + item_tokens > _MAX_BATCH_TOKENS and len(batch) > 0:
+                        # Put it back and dispatch current batch
+                        await _logprob_queue.put(item)
+                        break
+                    batch.append(item)
+                    batch_tokens += item_tokens
+                except asyncio.TimeoutError:
+                    break
+
+            # batch is a list of (prompts, prompt_lengths, top_logprobs, response_format, future)
+            # All items in a batch must share the same top_logprobs (enforced at dispatch time)
+            # Group by top_logprobs to handle mixed requests
+            groups = {}
+            for prompts, prompt_lengths, top_logprobs, response_format, future in batch:
+                key = top_logprobs
+                if key not in groups:
+                    groups[key] = []
+                groups[key].append((prompts, prompt_lengths, response_format, future))
+
+            for top_logprobs, items in groups.items():
+                # Merge all sequences into a single batch
+                all_prompts = []
+                all_prompt_lengths = []
+                offsets = []  # (start_idx, count) per original request
+                for prompts, prompt_lengths, response_format, future in items:
+                    start = len(all_prompts)
+                    all_prompts.extend(prompts)
+                    all_prompt_lengths.extend(prompt_lengths)
+                    offsets.append((start, len(prompts)))
+
+                sampling_params = SamplingParams(
+                    max_tokens=1,
+                    temperature=1.0,
+                    prompt_logprobs=top_logprobs,
                 )
-            all_logprobs.append(seq_logprobs)
-            all_token_ids.append(seq_token_ids)
 
-        return {"logprobs": all_logprobs, "logprob_token_ids": all_token_ids}
+                # Dispatch to workers in a thread to avoid blocking the event loop
+                try:
+                    all_outputs = await loop.run_in_executor(
+                        None, _run_prompt_logprobs, all_prompts, sampling_params
+                    )
+                except Exception as e:
+                    # Signal error to all waiting requests
+                    for _, _, _, future in items:
+                        if not future.done():
+                            future.set_exception(e)
+                    continue
+
+                # Split results back to individual requests
+                for (start, count), (_, prompt_lengths, response_format, future) in zip(offsets, items):
+                    outputs_slice = all_outputs[start : start + count]
+                    if not future.done():
+                        future.set_result((outputs_slice, prompt_lengths, top_logprobs, response_format))
+
+    def _format_logprob_response(all_outputs, prompt_lengths, top_k, response_format):
+        """Format vLLM outputs into the response dict (runs in any thread)."""
+        import numpy as np
+
+        batch_size = len(all_outputs)
+        use_binary = response_format == "binary"
+
+        if use_binary:
+            from starlette.responses import Response
+
+            comp_lengths = []
+            for output, prompt_length in zip(all_outputs, prompt_lengths, strict=True):
+                prompt_lps = output.prompt_logprobs
+                if prompt_lps is None:
+                    raise ValueError("prompt_logprobs is None.")
+                comp_lengths.append(len(prompt_lps) - prompt_length)
+
+            max_comp_len = max(comp_lengths) if comp_lengths else 0
+
+            # logprobs_arr / token_ids_arr: teacher's sorted top-k logprobs + token ids (for forward KL).
+            # actual_logprobs_arr / actual_token_ids_arr: actual token's teacher logprob (for reverse KL).
+            logprobs_arr = np.full((batch_size, max_comp_len, top_k), float("-inf"), dtype=np.float32)
+            token_ids_arr = np.zeros((batch_size, max_comp_len, top_k), dtype=np.int32)
+            actual_logprobs_arr = np.full((batch_size, max_comp_len, 1), float("-inf"), dtype=np.float32)
+            actual_token_ids_arr = np.zeros((batch_size, max_comp_len, 1), dtype=np.int32)
+
+            for i, (output, prompt_length) in enumerate(
+                zip(all_outputs, prompt_lengths, strict=True)
+            ):
+                prompt_lps = output.prompt_logprobs
+                seq_tokens = output.prompt_token_ids
+                if comp_lengths[i] == 0:
+                    continue
+
+                for pos in range(prompt_length, len(prompt_lps)):
+                    lp = prompt_lps[pos]
+                    if lp is None:
+                        continue
+                    t = pos - prompt_length
+                    actual_token = seq_tokens[pos]
+
+                    # Actual token's logprob (for reverse KL)
+                    if actual_token in lp:
+                        val = lp[actual_token].logprob
+                        if not math.isnan(val):
+                            actual_logprobs_arr[i, t, 0] = val
+                        actual_token_ids_arr[i, t, 0] = actual_token
+
+                    # Teacher's top-k logprobs (for forward KL)
+                    if top_k == 1:
+                        # Fast path: find rank-1 directly instead of sorting
+                        for token_id, logprob_obj in lp.items():
+                            if logprob_obj.rank == 1:
+                                val = logprob_obj.logprob
+                                if not math.isnan(val):
+                                    logprobs_arr[i, t, 0] = val
+                                token_ids_arr[i, t, 0] = token_id
+                                break
+                    else:
+                        sorted_items = sorted(lp.items(), key=lambda x: x[1].rank)
+                        for k_idx, (token_id, logprob_obj) in enumerate(sorted_items[:top_k]):
+                            val = logprob_obj.logprob
+                            if not math.isnan(val):
+                                logprobs_arr[i, t, k_idx] = val
+                            token_ids_arr[i, t, k_idx] = token_id
+
+            payload = {
+                "logprobs_b64": base64.b64encode(logprobs_arr.tobytes()).decode("ascii"),
+                "token_ids_b64": base64.b64encode(token_ids_arr.tobytes()).decode("ascii"),
+                "actual_logprobs_b64": base64.b64encode(actual_logprobs_arr.tobytes()).decode("ascii"),
+                "actual_token_ids_b64": base64.b64encode(actual_token_ids_arr.tobytes()).decode("ascii"),
+                "shape": [batch_size, max_comp_len, top_k],
+                "completion_lengths": comp_lengths,
+            }
+
+            try:
+                import orjson
+
+                return Response(content=orjson.dumps(payload), media_type="application/json")
+            except ImportError:
+                return payload
+        else:
+            all_logprobs = []
+            all_token_ids = []
+            for output, prompt_length in zip(all_outputs, prompt_lengths, strict=True):
+                prompt_lps = output.prompt_logprobs
+                if prompt_lps is None:
+                    raise ValueError("prompt_logprobs is None.")
+                seq_logprobs = []
+                seq_token_ids = []
+                for pos in range(prompt_length, len(prompt_lps)):
+                    lp = prompt_lps[pos]
+                    if lp is None:
+                        seq_logprobs.append([])
+                        seq_token_ids.append([])
+                        continue
+                    sorted_items = sorted(lp.items(), key=lambda x: x[1].rank)
+                    seq_token_ids.append([token_id for token_id, _ in sorted_items])
+                    seq_logprobs.append(
+                        [None if math.isnan(item.logprob) else item.logprob for _, item in sorted_items]
+                    )
+                all_logprobs.append(seq_logprobs)
+                all_token_ids.append(seq_token_ids)
+            return {"logprobs": all_logprobs, "logprob_token_ids": all_token_ids}
+
+    @app.post("/get_sequence_logprobs/")
+    async def get_sequence_logprobs(request: SequenceLogprobsRequest):
+        """
+        Computes teacher logprobs for existing token sequences without generating new tokens.
+
+        Concurrent requests are automatically batched and dispatched together to maximize
+        GPU utilization across DP workers. This avoids the event-loop-blocking problem where
+        synchronous pipe I/O serializes requests despite having multiple DP workers.
+
+        Supports two response formats:
+            - `"json"` (default): Nested lists, backward-compatible with existing clients.
+            - `"binary"`: Base64-encoded numpy arrays for fast serialization/deserialization.
+        """
+        if len(request.sequences) != len(request.prompt_lengths):
+            raise ValueError("sequences and prompt_lengths must have the same length.")
+
+        # Validate sequence lengths against max_model_len to prevent worker OOM crashes
+        if _max_model_len:
+            for i, seq in enumerate(request.sequences):
+                if len(seq) > _max_model_len:
+                    raise ValueError(
+                        f"Sequence {i} has length {len(seq)} which exceeds max_model_len={_max_model_len}. "
+                        f"Truncate sequences or increase --max-model-len."
+                    )
+
+        prompts = [{"prompt_token_ids": seq} for seq in request.sequences]
+
+        # Submit to the batching queue and await result
+        loop = asyncio.get_event_loop()
+        future = loop.create_future()
+        await _logprob_queue.put((
+            prompts,
+            list(request.prompt_lengths),
+            request.top_logprobs,
+            request.response_format,
+            future,
+        ))
+
+        # Wait for the batcher to process our request
+        all_outputs, prompt_lengths, top_k, response_format = await future
+
+        return _format_logprob_response(all_outputs, prompt_lengths, top_k, response_format)
 
     class ChatRequest(BaseModel):
         messages: list[list[dict]]
