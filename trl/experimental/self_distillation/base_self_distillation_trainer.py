@@ -209,7 +209,7 @@ class BaseSelfDistillationTrainer(OnlineRolloutMixin, SelfDistillationMixin, _Ba
                 top_k=args.top_k,
                 min_p=args.min_p,
                 max_completion_length=self.max_completion_length,
-                logprobs=0,
+                logprobs=None,
                 generation_kwargs=args.generation_kwargs,
             )
             self._last_loaded_step = -1  # tag to avoid useless loading during grad accumulation
