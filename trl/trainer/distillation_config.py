@@ -72,10 +72,10 @@ class DistillationConfig(_BaseConfig):
             Base URL of a vLLM server hosting the teacher model (e.g., `"http://localhost:8000"`). When set, teacher
             logprobs are fetched from the server instead of running a local forward pass. Mutually exclusive with
             passing a `teacher_model` object to the trainer.
-        teacher_server_top_logprobs (`int`, *optional*, defaults to `1`):
-            Number of top logprobs to request from the teacher server per token position. Only used when
-            `teacher_model_server_url` is set. Currently only `1` is supported — the server path uses a per-token
-            logprob approximation of the divergence. Full-vocabulary divergence is only available with a local teacher.
+        loss_top_k (`int`, *optional*, defaults to `0`):
+            Number of top tokens to use when computing the JSD/KL loss. Both student and teacher distributions are
+            restricted to these K tokens and re-normalized before computing divergence. If 0, the full vocabulary
+            is used. When using `teacher_model_server_url` with `beta > 0`, only `loss_top_k=1` is supported.
 
         > Parameters that control on-policy generation
 
@@ -119,6 +119,15 @@ class DistillationConfig(_BaseConfig):
             Frequency (in training steps) to synchronize student model weights to the vLLM engine.
         vllm_enable_sleep_mode (`bool`, *optional*, defaults to `False`):
             Enable vLLM sleep mode to offload student weights during the optimizer step.
+
+        > Parameters that control W&B logging
+
+        wandb_entity (`str` or `None`, *optional*):
+            The W&B entity to store runs under.
+        wandb_project (`str` or `None`, *optional*):
+            The W&B project to store runs under.
+        wandb_run_group (`str` or `None`, *optional*):
+            The W&B group to store runs under.
 
         > Parameters that control logging
 
@@ -215,10 +224,16 @@ class DistillationConfig(_BaseConfig):
             "When set, teacher logprobs are fetched from the server."
         },
     )
-    teacher_server_top_logprobs: int = field(
-        default=1,
-        metadata={"help": "Number of top logprobs to request from the teacher server per token position. "
-                  "Currently only `1` is supported for the server path."},
+    loss_top_k: int = field(
+        default=0,
+        metadata={
+            "help": "Number of top tokens to use when computing the JSD/KL loss. "
+            "Both student and teacher distributions are restricted to these K tokens "
+            "(selected based on beta: teacher's top-k for forward KL, student's top-k for reverse KL, "
+            "union of both for JSD) and re-normalized before computing divergence. "
+            "If 0, the full vocabulary is used (slower but exact). "
+            "Only supported with a local teacher — not with teacher_model_server_url."
+        },
     )
 
     # On-policy generation
@@ -300,6 +315,20 @@ class DistillationConfig(_BaseConfig):
         metadata={"help": "Enable vLLM sleep mode to offload student weights during the optimizer step."},
     )
 
+    # W&B
+    wandb_entity: str | None = field(
+        default=None,
+        metadata={"help": "The W&B entity to store runs under."},
+    )
+    wandb_project: str | None = field(
+        default=None,
+        metadata={"help": "The W&B project to store runs under."},
+    )
+    wandb_run_group: str | None = field(
+        default=None,
+        metadata={"help": "The W&B group to store runs under."},
+    )
+
     # Logging
     log_completions: bool = field(
         default=False,
@@ -346,12 +375,13 @@ class DistillationConfig(_BaseConfig):
                 f"{self.per_device_train_batch_size} * {self.gradient_accumulation_steps}."
             )
 
-        if self.teacher_model_server_url is not None and self.teacher_server_top_logprobs != 1:
+        if self.teacher_model_server_url is not None and self.beta > 0 and self.loss_top_k != 1:
             raise ValueError(
-                f"When using a teacher server (`teacher_model_server_url`), only `teacher_server_top_logprobs=1` is "
-                f"supported (got {self.teacher_server_top_logprobs}). The server computes a per-token logprob "
-                f"approximation of the divergence loss. Full-vocabulary divergence computation is only supported with "
-                f"a local teacher model."
+                f"loss_top_k != 1 with beta > 0 is not supported with teacher_model_server_url "
+                f"(got loss_top_k={self.loss_top_k}, beta={self.beta}). The server path always uses top-1 "
+                f"logprobs: any reverse KL component (beta > 0) requires the teacher's logprobs at the "
+                f"student's top-k tokens, which the server cannot provide for k > 1 or full vocabulary (k=0). "
+                f"Use a local teacher, set loss_top_k=1, or set beta=0 (pure forward KL)."
             )
 
         if self.num_generations > 1 and self.lmbda < 1.0:

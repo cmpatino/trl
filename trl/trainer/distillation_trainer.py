@@ -102,6 +102,63 @@ def _print_completions_sample(prompts: list[str], completions: list[str], step: 
     console.print(panel)
 
 
+def _add_tail_bucket(log_probs, valid_mask):
+    """Append a (K+1)-th tail element: log(1 - sum(exp(top_k_logps))).
+
+    This creates a proper probability distribution over K+1 elements, preventing
+    trivial zero loss when top_k is small (especially top_k=1).
+    """
+    log_sum = torch.logsumexp(log_probs, dim=-1, keepdim=True)
+    log_sum = torch.clamp(log_sum, max=-1e-7)  # ensure sum < 1
+    tail = torch.log(-torch.expm1(log_sum))  # log(1 - exp(log_sum))
+    tail_mask = torch.ones_like(valid_mask[..., :1], dtype=torch.bool)
+    return torch.cat([log_probs, tail], dim=-1), torch.cat([valid_mask, tail_mask], dim=-1)
+
+
+def _jsd_divergence(student_log_probs, teacher_log_probs, beta, support_mask=None):
+    """Compute JSD (or forward/reverse KL) from log-probability tensors.
+
+    When *support_mask* is not None, uses manual computation with masked
+    positions zeroed. When None, uses ``F.kl_div``.
+    """
+    if support_mask is not None:
+        safe_student = torch.where(support_mask, student_log_probs, torch.zeros_like(student_log_probs))
+        safe_teacher = torch.where(support_mask, teacher_log_probs, torch.zeros_like(teacher_log_probs))
+        student_probs = torch.where(support_mask, student_log_probs.exp(), torch.zeros_like(student_log_probs))
+        teacher_probs = torch.where(support_mask, teacher_log_probs.exp(), torch.zeros_like(teacher_log_probs))
+
+        if beta == 0:
+            return teacher_probs * (safe_teacher - safe_student)
+        elif beta == 1:
+            return student_probs * (safe_student - safe_teacher)
+        else:
+            beta_t = torch.tensor(beta, dtype=student_log_probs.dtype, device=student_log_probs.device)
+            tiny = torch.finfo(student_probs.dtype).tiny
+            mixture_probs = (1 - beta_t) * student_probs + beta_t * teacher_probs
+            safe_mixture = torch.where(
+                support_mask,
+                torch.log(mixture_probs.clamp_min(tiny)),
+                torch.zeros_like(student_log_probs),
+            )
+            kl_teacher = teacher_probs * (safe_teacher - safe_mixture)
+            kl_student = student_probs * (safe_student - safe_mixture)
+            return beta_t * kl_teacher + (1 - beta_t) * kl_student
+    else:
+        if beta == 0:
+            return F.kl_div(student_log_probs, teacher_log_probs, reduction="none", log_target=True)
+        elif beta == 1:
+            return F.kl_div(teacher_log_probs, student_log_probs, reduction="none", log_target=True)
+        else:
+            beta_t = torch.tensor(beta, dtype=student_log_probs.dtype, device=student_log_probs.device)
+            mixture_log_probs = torch.logsumexp(
+                torch.stack([student_log_probs + torch.log1p(-beta_t), teacher_log_probs + torch.log(beta_t)]),
+                dim=0,
+            )
+            kl_teacher = F.kl_div(mixture_log_probs, teacher_log_probs, reduction="none", log_target=True)
+            kl_student = F.kl_div(mixture_log_probs, student_log_probs, reduction="none", log_target=True)
+            return beta_t * kl_teacher + (1 - beta_t) * kl_student
+
+
 class _DistillationCollator:
     """Data collator for the distillation trainer with independent prompt/completion budgets.
 
@@ -447,7 +504,7 @@ class DistillationTrainer(_BaseTrainer):
         self.temperature = args.temperature
         self.top_p = args.top_p
         self.num_generations = args.num_generations
-        self.teacher_server_top_logprobs = args.teacher_server_top_logprobs
+        self.loss_top_k = args.loss_top_k
 
         # ── Buffer state ──
         self._buffered_inputs = None
@@ -914,6 +971,7 @@ class DistillationTrainer(_BaseTrainer):
         beta=0.5,
         temperature=1.0,
         reduction="batchmean",
+        top_k=0,
     ):
         """
         Compute the generalized Jensen-Shannon Divergence loss for knowledge distillation.
@@ -925,28 +983,62 @@ class DistillationTrainer(_BaseTrainer):
             beta: Interpolation coefficient. 0.0 = forward KL, 1.0 = reverse KL.
             temperature: Softmax temperature.
             reduction: 'batchmean', 'sum', 'mean', or 'none'.
+            top_k: Number of top tokens to restrict the loss to. The support set depends on beta:
+                beta=0 (forward KL) uses teacher's top-k, beta=1 (reverse KL) uses student's top-k,
+                0<beta<1 (JSD) uses the union of both. Distributions are re-normalized over the
+                selected support. If 0, the full vocabulary is used.
 
         Returns:
             Scalar loss tensor.
         """
         student_logits = student_logits / temperature
         teacher_logits = teacher_logits / temperature
-        student_log_probs = F.log_softmax(student_logits, dim=-1)
-        teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)
 
-        if beta == 0:
-            jsd = F.kl_div(student_log_probs, teacher_log_probs, reduction="none", log_target=True)
-        elif beta == 1:
-            jsd = F.kl_div(teacher_log_probs, student_log_probs, reduction="none", log_target=True)
+        support_mask = None
+
+        if top_k > 0 and student_logits.size(-1) > top_k:
+            neg_inf = torch.full((), float("-inf"), dtype=student_logits.dtype, device=student_logits.device)
+            student_log_probs_full = F.log_softmax(student_logits, dim=-1)
+            teacher_log_probs_full = F.log_softmax(teacher_logits, dim=-1)
+
+            if beta == 0:
+                # Forward KL: teacher-selected support
+                _, support = teacher_logits.topk(top_k, dim=-1)
+                support_mask = torch.ones_like(support, dtype=torch.bool)
+            elif beta == 1:
+                # Reverse KL: student-selected support
+                _, support = student_logits.topk(top_k, dim=-1)
+                support_mask = torch.ones_like(support, dtype=torch.bool)
+            else:
+                # JSD: union of both supports (concatenate + deduplicate)
+                _, student_top = student_logits.topk(top_k, dim=-1)
+                _, teacher_top = teacher_logits.topk(top_k, dim=-1)
+                support = torch.cat([teacher_top, student_top], dim=-1)
+                support_mask = torch.ones(support.shape, dtype=torch.bool, device=support.device)
+                for i in range(1, support.shape[-1]):
+                    prev_matches = support[..., i:i + 1] == support[..., :i]
+                    prev_valid = support_mask[..., :i]
+                    support_mask[..., i] &= ~(prev_matches & prev_valid).any(dim=-1)
+                support = torch.where(support_mask, support, torch.zeros_like(support))
+
+            student_support_logps = student_log_probs_full.gather(-1, support)
+            teacher_support_logps = teacher_log_probs_full.gather(-1, support)
+
+            # Mask invalid (duplicate) positions with -inf
+            student_topk_logps = torch.where(support_mask, student_support_logps, neg_inf)
+            teacher_topk_logps = torch.where(support_mask, teacher_support_logps, neg_inf)
+
+            # Add tail bucket: append log(1 - sum(exp(top_k_logps))) to preserve
+            # the remaining probability mass outside the top-k. This prevents trivial
+            # zero loss when top_k is small (especially top_k=1).
+            base_support_mask = support_mask
+            student_log_probs, support_mask = _add_tail_bucket(student_topk_logps, base_support_mask)
+            teacher_log_probs, _ = _add_tail_bucket(teacher_topk_logps, base_support_mask)
         else:
-            beta_t = torch.tensor(beta, dtype=student_log_probs.dtype, device=student_log_probs.device)
-            mixture_log_probs = torch.logsumexp(
-                torch.stack([student_log_probs + torch.log1p(-beta_t), teacher_log_probs + torch.log(beta_t)]),
-                dim=0,
-            )
-            kl_teacher = F.kl_div(mixture_log_probs, teacher_log_probs, reduction="none", log_target=True)
-            kl_student = F.kl_div(mixture_log_probs, student_log_probs, reduction="none", log_target=True)
-            jsd = beta_t * kl_teacher + (1 - beta_t) * kl_student
+            student_log_probs = F.log_softmax(student_logits, dim=-1)
+            teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)
+
+        jsd = _jsd_divergence(student_log_probs, teacher_log_probs, beta, support_mask)
 
         if labels is not None:
             mask = labels != -100
@@ -1047,12 +1139,14 @@ class DistillationTrainer(_BaseTrainer):
             sequences.append(seq)
             prompt_lengths.append(prompt_length)
 
-        K = self.teacher_server_top_logprobs
+        # Server path always uses top-1 logprobs. Top-k loss requires a local teacher
+        # since reverse KL needs the teacher's logprobs at the student's top-k tokens.
         result = self.teacher_client.get_sequence_logprobs(
             sequences=sequences,
             prompt_lengths=prompt_lengths,
-            top_logprobs=K,
+            top_logprobs=1,
         )
+        K = 1
 
         device = input_ids.device
         completion_length = max(len(lps) for lps in result["logprobs"])
@@ -1181,6 +1275,7 @@ class DistillationTrainer(_BaseTrainer):
                 labels=labels,
                 beta=self.beta,
                 temperature=self.temperature,
+                top_k=self.loss_top_k,
             )
 
         return (loss, student_outputs) if return_outputs else loss
@@ -1299,6 +1394,12 @@ class DistillationTrainer(_BaseTrainer):
             self._metrics[mode][f"completions/{prefix}_mean_length"].append(gathered_lengths.mean().item())
             self._metrics[mode][f"completions/{prefix}_max_length"].append(gathered_lengths.max().item())
             self._metrics[mode][f"completions/{prefix}_min_length"].append(gathered_lengths.min().item())
+
+            # Log fraction of completions that hit max_completion_length (truncated)
+            max_comp_len = getattr(self.generation_config, "max_new_tokens", None)
+            if is_on_policy and max_comp_len is not None:
+                truncated_frac = (gathered_lengths >= max_comp_len).float().mean().item()
+                self._metrics[mode]["completions/truncated_fraction"].append(truncated_frac)
 
         # Track loss per policy type
         loss_scalar = float(loss.detach())
