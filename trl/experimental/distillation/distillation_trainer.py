@@ -288,7 +288,9 @@ class _DistillationCollator:
             raise ValueError("Conversational examples must contain either a 'messages' key or a 'prompt' key.")
 
         prompt_messages = example["prompt"]
-        formatted_prompt = self.tokenizer.apply_chat_template(prompt_messages, tokenize=False, add_generation_prompt=True)
+        formatted_prompt = self.tokenizer.apply_chat_template(
+            prompt_messages, tokenize=False, add_generation_prompt=True
+        )
         prompt_ids = self.tokenizer(
             formatted_prompt,
             truncation=True,
