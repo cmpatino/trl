@@ -39,6 +39,7 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from transformers.trainer_utils import EvalPrediction, seed_worker
 from transformers.utils import is_liger_kernel_available, is_peft_available, is_rich_available
 
+from ...data_utils import is_conversational
 from ...extras.profiling import profiling_decorator
 from ...generation.vllm_generation import VLLMGeneration
 from ...import_utils import is_vllm_available
@@ -211,6 +212,9 @@ class _DistillationCollator:
     Unlike ``DataCollatorForChatML``, this collator tokenizes prompts and completions separately so that long
     completions can never truncate the prompt to empty. It also handles prompt-only data (no assistant completions) for
     pure on-policy distillation (``lmbda=1``).
+
+    Accepts datasets in either conversational (``messages``) or standard (``prompt`` + optional ``completion``) format.
+    Prompt-only examples are only supported when ``lmbda=1.0``. The format is auto-detected per example.
     """
 
     def __init__(
@@ -218,17 +222,115 @@ class _DistillationCollator:
         tokenizer: "PreTrainedTokenizerBase",
         max_length: int,
         max_prompt_length: int,
+        lmbda: float = 1.0,
         messages_key: str = "messages",
         ignore_index: int = -100,
     ):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.max_prompt_length = max_prompt_length
+        self.lmbda = lmbda
         self.messages_key = messages_key
         self.ignore_index = ignore_index
 
         if tokenizer.pad_token_id is None:
             raise ValueError("The tokenizer does not have a pad token. Please set `pad_token_id` in the tokenizer.")
+
+    def _tokenize_conversational(self, example: dict[str, Any]) -> tuple[list[int], list[int]]:
+        """Tokenize a conversational example (list of ``{role, content}`` dicts). Returns ``(prompt_ids, completion_ids)``."""
+        messages = example[self.messages_key]
+
+        # Split: prompt = everything before the last assistant turn, completion = last assistant turn
+        has_completion = len(messages) > 1 and messages[-1].get("role") == "assistant"
+        prompt_messages = messages[:-1] if has_completion else messages
+
+        # Tokenize prompt with its own budget using the tokenizer's truncation side
+        formatted_prompt = self.tokenizer.apply_chat_template(
+            prompt_messages, tokenize=False, add_generation_prompt=True
+        )
+        prompt_ids = self.tokenizer(
+            formatted_prompt,
+            truncation=True,
+            max_length=self.max_prompt_length,
+            padding=False,
+            add_special_tokens=False,
+        )["input_ids"]
+
+        if has_completion:
+            # Tokenize the full message (prompt + completion) without truncation first
+            formatted_full = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+            full_ids = self.tokenizer(formatted_full, truncation=False, padding=False, add_special_tokens=False)[
+                "input_ids"
+            ]
+
+            # Identify completion tokens: everything after the prompt in the full sequence.
+            # Use the un-truncated prompt length as the split point.
+            formatted_prompt_ids = self.tokenizer(
+                formatted_prompt, truncation=False, padding=False, add_special_tokens=False
+            )["input_ids"]
+            completion_ids = full_ids[len(formatted_prompt_ids) :]
+
+            # Trim completion so prompt + completion <= max_length
+            max_comp = self.max_length - len(prompt_ids)
+            if max_comp > 0 and len(completion_ids) > max_comp:
+                completion_ids = completion_ids[:max_comp]
+            elif max_comp <= 0:
+                completion_ids = []
+
+            return list(prompt_ids), list(completion_ids)
+
+        return list(prompt_ids), []
+
+    def _tokenize_standard(self, example: dict[str, Any]) -> tuple[list[int], list[int]]:
+        """Tokenize a standard (plain-text) example with ``prompt`` and optional ``completion`` keys.
+
+        Returns ``(prompt_ids, completion_ids)``.
+        """
+        prompt_text = example["prompt"]
+        prompt_ids = self.tokenizer(
+            prompt_text,
+            truncation=True,
+            max_length=self.max_prompt_length,
+            padding=False,
+            add_special_tokens=True,
+        )["input_ids"]
+
+        if "completion" in example and example["completion"]:
+            full_ids = self.tokenizer(
+                prompt_text + example["completion"],
+                truncation=False,
+                padding=False,
+                add_special_tokens=True,
+            )["input_ids"]
+            untruncated_prompt_ids = self.tokenizer(
+                prompt_text, truncation=False, padding=False, add_special_tokens=True
+            )["input_ids"]
+            if full_ids[: len(untruncated_prompt_ids)] != untruncated_prompt_ids:
+                warnings.warn(
+                    "Mismatch between tokenized prompt and the start of tokenized prompt+completion. "
+                    "This may be due to unexpected tokenizer behavior, whitespace issues, or special token "
+                    "handling. Verify that the tokenizer is processing text consistently.",
+                    stacklevel=2,
+                )
+            completion_ids = full_ids[len(untruncated_prompt_ids) :]
+
+            # Append EOS so the student learns to stop (chat templates include their own end marker,
+            # but plain text does not). Mirrors SFTTrainer's `add_eos` text-level check.
+            if self.tokenizer.eos_token_id is not None and not example["completion"].endswith(
+                self.tokenizer.eos_token
+            ):
+                completion_ids = completion_ids + [self.tokenizer.eos_token_id]
+
+            # Trim completion so prompt + completion <= max_length
+            max_comp = self.max_length - len(prompt_ids)
+            if max_comp > 0 and len(completion_ids) > max_comp:
+                completion_ids = completion_ids[:max_comp]
+            elif max_comp <= 0:
+                completion_ids = []
+
+            return list(prompt_ids), list(completion_ids)
+
+        return list(prompt_ids), []
 
     def __call__(self, examples: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
         all_input_ids: list[list[int]] = []
@@ -236,47 +338,23 @@ class _DistillationCollator:
         all_prompt_ids: list[list[int]] = []
 
         for example in examples:
-            messages = example[self.messages_key]
-
-            # Split: prompt = everything before the last assistant turn, completion = last assistant turn
-            has_completion = len(messages) > 1 and messages[-1].get("role") == "assistant"
-            prompt_messages = messages[:-1] if has_completion else messages
-
-            # Tokenize prompt with its own budget using the tokenizer's truncation side
-            formatted_prompt = self.tokenizer.apply_chat_template(
-                prompt_messages, tokenize=False, add_generation_prompt=True
-            )
-            prompt_ids = self.tokenizer(
-                formatted_prompt,
-                truncation=True,
-                max_length=self.max_prompt_length,
-                padding=False,
-                add_special_tokens=False,
-            )["input_ids"]
-
-            if has_completion:
-                # Tokenize the full message (prompt + completion) without truncation first
-                formatted_full = self.tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=False
+            if is_conversational(example):
+                prompt_ids, completion_ids = self._tokenize_conversational(example)
+            elif "prompt" in example:
+                prompt_ids, completion_ids = self._tokenize_standard(example)
+            else:
+                raise ValueError(
+                    "Each example must contain either a 'messages' key (conversational format) or a 'prompt' key "
+                    "(standard format)."
                 )
-                full_ids = self.tokenizer(formatted_full, truncation=False, padding=False, add_special_tokens=False)[
-                    "input_ids"
-                ]
 
-                # Identify completion tokens: everything after the prompt in the full sequence.
-                # Use the un-truncated prompt length as the split point.
-                formatted_prompt_ids = self.tokenizer(
-                    formatted_prompt, truncation=False, padding=False, add_special_tokens=False
-                )["input_ids"]
-                completion_ids = full_ids[len(formatted_prompt_ids) :]
+            if not completion_ids and self.lmbda < 1.0:
+                raise ValueError(
+                    "Examples without completion tokens after tokenization require `lmbda=1.0` because off-policy "
+                    "distillation needs dataset completions."
+                )
 
-                # Trim completion so prompt + completion <= max_length
-                max_comp = self.max_length - len(prompt_ids)
-                if max_comp > 0 and len(completion_ids) > max_comp:
-                    completion_ids = completion_ids[:max_comp]
-                elif max_comp <= 0:
-                    completion_ids = []
-
+            if completion_ids:
                 input_ids = prompt_ids + completion_ids
                 labels = [self.ignore_index] * len(prompt_ids) + list(completion_ids)
             else:
@@ -363,6 +441,8 @@ class DistillationTrainer(_BaseTrainer):
     - Local teacher model or external teacher via vLLM server
     - Student on-policy generation via vLLM or model.generate()
     - Liger kernel for memory-efficient fused JSD loss
+    - Datasets in either conversational (`messages`) or standard (`prompt` + optional `completion`) format with
+      prompt-only examples supported when `lmbda=1.0`
     """
 
     _tag_names = ["trl", "distillation"]
@@ -438,6 +518,7 @@ class DistillationTrainer(_BaseTrainer):
                 tokenizer=processing_class,
                 max_length=args.max_length,
                 max_prompt_length=args.max_prompt_length,
+                lmbda=args.lmbda,
             )
 
         # ── Liger fused JSD loss ──
