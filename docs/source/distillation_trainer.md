@@ -102,8 +102,8 @@ The [`experimental.distillation.DistillationTrainer`] supports both [conversatio
               {"role": "assistant", "content": "It is blue."}]}
 
 # Standard prompt-completion
-{"prompt": "The sky is",
- "completion": " blue."}
+{"prompt": "What color is the sky?",
+ "completion": "It is blue."}
 ```
 
 When using fully on-policy distillation (`lmbda=1.0`), the completion can be omitted since the student will generate its own completions:
@@ -113,7 +113,7 @@ When using fully on-policy distillation (`lmbda=1.0`), the completion can be omi
 {"messages": [{"role": "user", "content": "What color is the sky?"}]}
 
 # Standard prompt-only
-{"prompt": "The sky is"}
+{"prompt": "What color is the sky?"}
 ```
 
 Prompt-only examples require `lmbda=1.0` (fully on-policy), since off-policy distillation needs dataset completions.
