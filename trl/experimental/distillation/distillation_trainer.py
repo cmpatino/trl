@@ -237,17 +237,58 @@ class _DistillationCollator:
             raise ValueError("The tokenizer does not have a pad token. Please set `pad_token_id` in the tokenizer.")
 
     def _tokenize_conversational(self, example: dict[str, Any]) -> tuple[list[int], list[int]]:
-        """Tokenize a conversational example (list of ``{role, content}`` dicts). Returns ``(prompt_ids, completion_ids)``."""
-        messages = example[self.messages_key]
+        """Tokenize a conversational example with either ``messages`` or ``prompt``/``completion`` keys."""
+        if self.messages_key in example:
+            messages = example[self.messages_key]
 
-        # Split: prompt = everything before the last assistant turn, completion = last assistant turn
-        has_completion = len(messages) > 1 and messages[-1].get("role") == "assistant"
-        prompt_messages = messages[:-1] if has_completion else messages
+            # Split: prompt = everything before the last assistant turn, completion = last assistant turn
+            has_completion = len(messages) > 1 and messages[-1].get("role") == "assistant"
+            prompt_messages = messages[:-1] if has_completion else messages
 
-        # Tokenize prompt with its own budget using the tokenizer's truncation side
-        formatted_prompt = self.tokenizer.apply_chat_template(
-            prompt_messages, tokenize=False, add_generation_prompt=True
-        )
+            # Tokenize prompt with its own budget using the tokenizer's truncation side
+            formatted_prompt = self.tokenizer.apply_chat_template(
+                prompt_messages, tokenize=False, add_generation_prompt=True
+            )
+            prompt_ids = self.tokenizer(
+                formatted_prompt,
+                truncation=True,
+                max_length=self.max_prompt_length,
+                padding=False,
+                add_special_tokens=False,
+            )["input_ids"]
+
+            if has_completion:
+                # Tokenize the full message (prompt + completion) without truncation first
+                formatted_full = self.tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=False
+                )
+                full_ids = self.tokenizer(formatted_full, truncation=False, padding=False, add_special_tokens=False)[
+                    "input_ids"
+                ]
+
+                # Identify completion tokens: everything after the prompt in the full sequence.
+                # Use the un-truncated prompt length as the split point.
+                formatted_prompt_ids = self.tokenizer(
+                    formatted_prompt, truncation=False, padding=False, add_special_tokens=False
+                )["input_ids"]
+                completion_ids = full_ids[len(formatted_prompt_ids) :]
+
+                # Trim completion so prompt + completion <= max_length
+                max_comp = self.max_length - len(prompt_ids)
+                if max_comp > 0 and len(completion_ids) > max_comp:
+                    completion_ids = completion_ids[:max_comp]
+                elif max_comp <= 0:
+                    completion_ids = []
+
+                return list(prompt_ids), list(completion_ids)
+
+            return list(prompt_ids), []
+
+        if "prompt" not in example:
+            raise ValueError("Conversational examples must contain either a 'messages' key or a 'prompt' key.")
+
+        prompt_messages = example["prompt"]
+        formatted_prompt = self.tokenizer.apply_chat_template(prompt_messages, tokenize=False, add_generation_prompt=True)
         prompt_ids = self.tokenizer(
             formatted_prompt,
             truncation=True,
@@ -256,18 +297,23 @@ class _DistillationCollator:
             add_special_tokens=False,
         )["input_ids"]
 
-        if has_completion:
-            # Tokenize the full message (prompt + completion) without truncation first
-            formatted_full = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+        if "completion" in example and example["completion"]:
+            formatted_full = self.tokenizer.apply_chat_template(
+                prompt_messages + example["completion"], tokenize=False, add_generation_prompt=False
+            )
             full_ids = self.tokenizer(formatted_full, truncation=False, padding=False, add_special_tokens=False)[
                 "input_ids"
             ]
-
-            # Identify completion tokens: everything after the prompt in the full sequence.
-            # Use the un-truncated prompt length as the split point.
             formatted_prompt_ids = self.tokenizer(
                 formatted_prompt, truncation=False, padding=False, add_special_tokens=False
             )["input_ids"]
+            if full_ids[: len(formatted_prompt_ids)] != formatted_prompt_ids:
+                warnings.warn(
+                    "Mismatch between tokenized prompt and the start of tokenized prompt+completion. "
+                    "This may be due to unexpected tokenizer behavior, whitespace issues, or special token "
+                    "handling. Verify that the tokenizer is processing text consistently.",
+                    stacklevel=2,
+                )
             completion_ids = full_ids[len(formatted_prompt_ids) :]
 
             # Trim completion so prompt + completion <= max_length
@@ -338,7 +384,9 @@ class _DistillationCollator:
         all_prompt_ids: list[list[int]] = []
 
         for example in examples:
-            if is_conversational(example):
+            if self.messages_key in example:
+                prompt_ids, completion_ids = self._tokenize_conversational(example)
+            elif "prompt" in example and is_conversational(example):
                 prompt_ids, completion_ids = self._tokenize_conversational(example)
             elif "prompt" in example:
                 prompt_ids, completion_ids = self._tokenize_standard(example)
