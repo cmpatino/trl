@@ -388,7 +388,7 @@ class _DistillationCollator:
         for example in examples:
             if self.messages_key in example:
                 prompt_ids, completion_ids = self._tokenize_conversational(example)
-            elif "prompt" in example and is_conversational(example):
+            elif "prompt" in example and is_conversational({"prompt": example["prompt"]}):
                 prompt_ids, completion_ids = self._tokenize_conversational(example)
             elif "prompt" in example:
                 prompt_ids, completion_ids = self._tokenize_standard(example)
