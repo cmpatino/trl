@@ -353,19 +353,35 @@ class _DistillationCollator:
             untruncated_prompt_ids = self.tokenizer(
                 prompt_text, truncation=False, padding=False, add_special_tokens=True
             )["input_ids"]
-            if full_ids[: len(untruncated_prompt_ids)] != untruncated_prompt_ids:
+            common_prefix_length = 0
+            for prompt_id, full_id in zip(untruncated_prompt_ids, full_ids, strict=False):
+                if prompt_id != full_id:
+                    break
+                common_prefix_length += 1
+
+            if common_prefix_length != len(untruncated_prompt_ids):
                 warnings.warn(
                     "Mismatch between tokenized prompt and the start of tokenized prompt+completion. "
                     "This may be due to unexpected tokenizer behavior, whitespace issues, or special token "
                     "handling. Verify that the tokenizer is processing text consistently.",
                     stacklevel=2,
                 )
-            completion_ids = full_ids[len(untruncated_prompt_ids) :]
+            aligned_prompt_ids = full_ids[:common_prefix_length]
+            if len(aligned_prompt_ids) > self.max_prompt_length:
+                if getattr(self.tokenizer, "truncation_side", "right") == "left":
+                    prompt_ids = aligned_prompt_ids[-self.max_prompt_length :]
+                else:
+                    prompt_ids = aligned_prompt_ids[: self.max_prompt_length]
+            else:
+                prompt_ids = aligned_prompt_ids
+            completion_ids = full_ids[common_prefix_length:]
 
             # Append EOS so the student learns to stop (chat templates include their own end marker,
             # but plain text does not). Mirrors SFTTrainer's `add_eos` text-level check.
-            if self.tokenizer.eos_token_id is not None and not example["completion"].endswith(
-                self.tokenizer.eos_token
+            if (
+                self.tokenizer.eos_token_id is not None
+                and not example["completion"].endswith(self.tokenizer.eos_token)
+                and (not completion_ids or completion_ids[-1] != self.tokenizer.eos_token_id)
             ):
                 completion_ids = completion_ids + [self.tokenizer.eos_token_id]
 
