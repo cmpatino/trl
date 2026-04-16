@@ -368,7 +368,7 @@ class _DistillationCollator:
                 )
             aligned_prompt_ids = full_ids[:common_prefix_length]
             if len(aligned_prompt_ids) > self.max_prompt_length:
-                if getattr(self.tokenizer, "truncation_side", "right") == "left":
+                if self.tokenizer.truncation_side == "left":
                     prompt_ids = aligned_prompt_ids[-self.max_prompt_length :]
                 else:
                     prompt_ids = aligned_prompt_ids[: self.max_prompt_length]
