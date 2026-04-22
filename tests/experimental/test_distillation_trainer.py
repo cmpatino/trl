@@ -12,66 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import warnings
-from types import SimpleNamespace
+import os
 
 import pytest
 import torch
 import torch.nn.functional as F
+from datasets import load_dataset
+from transformers import AutoTokenizer
 
 from trl.experimental.distillation import DistillationConfig, DistillationTrainer
-from trl.experimental.distillation.distillation_trainer import (
-    _jsd_divergence,
-    _RepeatBatchDataLoader,
-    build_teacher_request_inputs,
-)
+from trl.experimental.distillation.distillation_trainer import _RepeatBatchDataLoader, build_teacher_request_inputs
+
+from ..testing_utils import TrlTestCase, require_liger_kernel
 
 
-class DummyStudentModel:
-    def __init__(self, logits):
-        self.logits = logits
-
-    def __call__(self, input_ids, attention_mask):
-        return SimpleNamespace(logits=self.logits)
-
-
-class DummyTeacherModel:
-    def __init__(self, logits):
-        self.logits = logits
-        self.eval_called = False
-        self.last_kwargs = None
-
-    def eval(self):
-        self.eval_called = True
-
-    def __call__(self, **kwargs):
-        self.last_kwargs = kwargs
-        return SimpleNamespace(logits=self.logits)
-
-
-class DummyTeacherClient:
-    def __init__(self, result):
-        self.result = result
-        self.calls = []
-
-    def get_sequence_logprobs(self, sequences, prompt_lengths, top_logprobs, temperature):
-        self.calls.append(
-            {
-                "sequences": sequences,
-                "prompt_lengths": prompt_lengths,
-                "top_logprobs": top_logprobs,
-                "temperature": temperature,
-            }
-        )
-        return self.result
-
-
-def _make_inputs(input_ids, labels):
-    return {
-        "input_ids": torch.tensor([input_ids], dtype=torch.long),
-        "attention_mask": torch.ones((1, len(input_ids)), dtype=torch.long),
-        "labels": torch.tensor([labels], dtype=torch.long),
-    }
+def _make_distillation_config_kwargs(tmp_path):
+    return {"output_dir": str(tmp_path), "report_to": "none", "use_cpu": True, "bf16": False}
 
 
 def _build_server_result(teacher_logits, inputs, temperature=1.0):
@@ -89,334 +45,382 @@ def _build_server_result(teacher_logits, inputs, temperature=1.0):
     }
 
 
-def _build_local_trainer(teacher_logits, beta, reverse_mode="sampled", loss_add_tail=True):
-    trainer = DistillationTrainer.__new__(DistillationTrainer)
-    trainer.teacher_model = DummyTeacherModel(teacher_logits)
-    trainer.teacher_client = None
-    trainer.use_teacher_server = False
-    trainer.teacher_model_server_url = None
-    trainer.use_liger_loss = False
-    trainer._local_teacher_tokenizer_matches_student = True
-    trainer.beta = beta
-    trainer.temperature = 1.0
-    trainer.reverse_kl_top_1_mode = reverse_mode
-    trainer.loss_top_k = 1
-    trainer.loss_add_tail = loss_add_tail
-    return trainer
+class RecordingTeacherClient:
+    def __init__(self):
+        self.calls = []
+        self.result = None
 
-
-def _build_server_trainer(server_result, beta, loss_add_tail=True):
-    trainer = DistillationTrainer.__new__(DistillationTrainer)
-    trainer.teacher_model = None
-    trainer.teacher_client = DummyTeacherClient(server_result)
-    trainer.use_teacher_server = True
-    trainer.teacher_model_server_url = "http://localhost:8000"
-    trainer.use_liger_loss = False
-    trainer._local_teacher_tokenizer_matches_student = True
-    trainer.beta = beta
-    trainer.temperature = 1.0
-    trainer.reverse_kl_top_1_mode = "sampled"
-    trainer.loss_top_k = 1
-    trainer.loss_add_tail = loss_add_tail
-    return trainer
+    def get_sequence_logprobs(self, sequences, prompt_lengths, top_logprobs, temperature):
+        self.calls.append(
+            {
+                "sequences": sequences,
+                "prompt_lengths": prompt_lengths,
+                "top_logprobs": top_logprobs,
+                "temperature": temperature,
+            }
+        )
+        return self.result
 
 
 def test_distillation_config_rejects_liger_with_teacher_server(tmp_path):
     with pytest.raises(ValueError, match="use_liger_kernel=True is not supported with use_teacher_server=True"):
         DistillationConfig(
-            output_dir=str(tmp_path),
+            **_make_distillation_config_kwargs(tmp_path),
             use_teacher_server=True,
             teacher_model_server_url="http://localhost:8000",
             use_liger_kernel=True,
-            report_to="none",
         )
 
 
 def test_distillation_config_rejects_invalid_reverse_kl_top_1_mode(tmp_path):
     with pytest.raises(ValueError, match="reverse_kl_top_1_mode must be one of"):
-        DistillationConfig(output_dir=str(tmp_path), reverse_kl_top_1_mode="invalid", report_to="none")
+        DistillationConfig(**_make_distillation_config_kwargs(tmp_path), reverse_kl_top_1_mode="invalid")
 
 
 def test_distillation_config_rejects_teacher_server_with_reverse_kl_argmax(tmp_path):
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        with pytest.raises(ValueError, match="reverse_kl_top_1_mode='argmax' is not supported"):
-            DistillationConfig(
-                output_dir=str(tmp_path),
-                use_teacher_server=True,
-                teacher_model_server_url="http://localhost:8000",
-                reverse_kl_top_1_mode="argmax",
-                report_to="none",
-            )
-
-    assert caught == []
+    with pytest.raises(ValueError, match="reverse_kl_top_1_mode='argmax' is not supported"):
+        DistillationConfig(
+            **_make_distillation_config_kwargs(tmp_path),
+            use_teacher_server=True,
+            teacher_model_server_url="http://localhost:8000",
+            reverse_kl_top_1_mode="argmax",
+        )
 
 
 def test_distillation_config_rejects_teacher_server_mixed_loss_without_top_1(tmp_path):
     with pytest.raises(ValueError, match="loss_top_k must be 1 when using use_teacher_server=True with beta>0"):
         DistillationConfig(
-            output_dir=str(tmp_path),
+            **_make_distillation_config_kwargs(tmp_path),
             use_teacher_server=True,
             teacher_model_server_url="http://localhost:8000",
             beta=0.5,
             loss_top_k=2,
-            report_to="none",
         )
 
 
 def test_distillation_config_requires_teacher_server_url(tmp_path):
     with pytest.raises(ValueError, match="teacher_model_server_url must be set when use_teacher_server=True"):
-        DistillationConfig(output_dir=str(tmp_path), use_teacher_server=True, beta=0.5, loss_top_k=1, report_to="none")
-
-
-def test_get_teacher_logits_uses_local_teacher_model():
-    expected_logits = torch.randn(2, 3, 4)
-
-    trainer = DistillationTrainer.__new__(DistillationTrainer)
-    trainer.teacher_model = DummyTeacherModel(expected_logits)
-    trainer.teacher_client = None
-    trainer.use_teacher_server = False
-    trainer.teacher_model_server_url = None
-
-    inputs = {
-        "input_ids": torch.tensor([[1, 2, 3], [4, 5, 6]]),
-        "attention_mask": torch.tensor([[1, 1, 1], [0, 1, 1]]),
-    }
-
-    logits = DistillationTrainer._get_teacher_logits(trainer, inputs)
-
-    assert trainer.teacher_model.eval_called is True
-    assert trainer.teacher_model.last_kwargs == inputs
-    assert torch.equal(logits, expected_logits)
-
-
-def test_get_teacher_logits_rejects_teacher_server():
-    trainer = DistillationTrainer.__new__(DistillationTrainer)
-    trainer.teacher_model = None
-    trainer.teacher_client = None
-    trainer.use_teacher_server = True
-    trainer.teacher_model_server_url = None
-
-    with pytest.raises(NotImplementedError, match="Server-backed distillation only supports per-token logprobs"):
-        DistillationTrainer._get_teacher_logits(
-            trainer,
-            {
-                "input_ids": torch.tensor([[1, 2, 3]]),
-                "attention_mask": torch.tensor([[1, 1, 1]]),
-            },
+        DistillationConfig(
+            **_make_distillation_config_kwargs(tmp_path),
+            use_teacher_server=True,
+            beta=0.5,
+            loss_top_k=1,
         )
 
 
-@pytest.mark.parametrize("beta", [1.0, 0.5])
-def test_local_argmax_mode_matches_previous_local_top_1_behavior(beta):
-    inputs = _make_inputs(input_ids=[9, 1, 2], labels=[-100, 1, 2])
-    student_logits = torch.tensor(
-        [
-            [
-                [0.1, 3.2, 0.3, 1.1],
-                [2.4, 0.1, 0.2, 1.7],
-                [0.0, 0.0, 0.0, 0.0],
-            ]
-        ],
-        dtype=torch.float32,
-    )
-    teacher_logits = torch.tensor(
-        [
-            [
-                [0.2, 2.7, 0.1, 1.4],
-                [1.9, 0.3, 0.2, 2.2],
-                [0.0, 0.0, 0.0, 0.0],
-            ]
-        ],
-        dtype=torch.float32,
-    )
-
-    trainer = _build_local_trainer(teacher_logits, beta=beta, reverse_mode="argmax")
-    loss = DistillationTrainer.compute_loss(trainer, DummyStudentModel(student_logits), inputs)
-
-    prompt_length = 1
-    expected = DistillationTrainer.generalized_jsd_loss(
-        student_logits=student_logits[:, prompt_length - 1 : -1, :],
-        teacher_logits=teacher_logits[:, prompt_length - 1 : -1, :],
-        labels=inputs["labels"][:, prompt_length:],
-        beta=beta,
-        temperature=1.0,
-        top_k=1,
-        add_tail=True,
-    )
-
-    torch.testing.assert_close(loss, expected)
-
-
-def test_sampled_mode_matches_between_local_and_external_teachers():
-    inputs = _make_inputs(input_ids=[9, 1, 2], labels=[-100, 1, 2])
-    student_logits = torch.tensor(
-        [
-            [
-                [0.2, 0.1, 3.5, 1.0],
-                [1.0, 0.2, 0.3, 2.8],
-                [0.0, 0.0, 0.0, 0.0],
-            ]
-        ],
-        dtype=torch.float32,
-    )
-    teacher_logits = torch.tensor(
-        [
-            [
-                [0.1, 0.2, 1.3, 3.4],
-                [0.2, 0.1, 3.1, 2.9],
-                [0.0, 0.0, 0.0, 0.0],
-            ]
-        ],
-        dtype=torch.float32,
-    )
-
-    local_trainer = _build_local_trainer(teacher_logits, beta=0.5, reverse_mode="sampled")
-    local_loss = DistillationTrainer.compute_loss(local_trainer, DummyStudentModel(student_logits), inputs)
-
-    server_result = _build_server_result(teacher_logits, inputs)
-    server_trainer = _build_server_trainer(server_result, beta=0.5)
-    server_loss = DistillationTrainer.compute_loss(server_trainer, DummyStudentModel(student_logits), inputs)
-
-    assert server_trainer.teacher_client.calls[0]["top_logprobs"] == 1
-    torch.testing.assert_close(local_loss, server_loss)
-
-
-def test_sampled_mode_keeps_teacher_argmax_for_forward_support():
-    inputs = _make_inputs(input_ids=[9, 1], labels=[-100, 1])
-    student_logits = torch.tensor([[[0.4, 0.3, 2.0, 1.1], [0.0, 0.0, 0.0, 0.0]]], dtype=torch.float32)
-    teacher_logits = torch.tensor([[[0.2, 0.1, 0.4, 2.5], [0.0, 0.0, 0.0, 0.0]]], dtype=torch.float32)
-
-    server_result = _build_server_result(teacher_logits, inputs)
-    server_trainer = _build_server_trainer(server_result, beta=0.5, loss_add_tail=False)
-    loss = DistillationTrainer.compute_loss(server_trainer, DummyStudentModel(student_logits), inputs)
-
-    prompt_length = 1
-    student_log_probs = F.log_softmax(student_logits[:, prompt_length - 1 : -1, :], dim=-1)
-    teacher_log_probs = F.log_softmax(teacher_logits[:, prompt_length - 1 : -1, :], dim=-1)
-    support = torch.tensor([[[3, 1]]], dtype=torch.long)
-    support_mask = torch.ones_like(support, dtype=torch.bool)
-    student_support = student_log_probs.gather(-1, support)
-    teacher_support = teacher_log_probs.gather(-1, support)
-    student_support = student_support - torch.logsumexp(student_support, dim=-1, keepdim=True)
-    teacher_support = teacher_support - torch.logsumexp(teacher_support, dim=-1, keepdim=True)
-    expected = _jsd_divergence(student_support, teacher_support, beta=0.5, support_mask=support_mask).sum()
-
-    torch.testing.assert_close(loss, expected)
-
-
-def test_server_teacher_path_handles_variable_prompt_lengths():
-    class VariablePromptTeacherClient(DummyTeacherClient):
-        def get_sequence_logprobs(self, sequences, prompt_lengths, top_logprobs, temperature):
-            assert sequences == [[10, 11, 12, 20, 21], [30, 31, 32, 33, 34, 40, 41]]
-            assert prompt_lengths == [3, 5]
-            assert top_logprobs == 1
-            return self.result
-
-    trainer = DistillationTrainer.__new__(DistillationTrainer)
-    trainer.teacher_model = None
-    trainer.teacher_client = VariablePromptTeacherClient(
-        {
-            "actual_logprobs": [[[-0.1], [-0.2]], [[-0.3], [-0.4]]],
-            "logprobs": [[[-0.1], [-0.2]], [[-0.3], [-0.4]]],
-            "logprob_token_ids": [[[20], [21]], [[40], [41]]],
-        }
-    )
-    trainer.use_teacher_server = True
-    trainer.teacher_model_server_url = "http://localhost:8000"
-    trainer.use_liger_loss = False
-    trainer._local_teacher_tokenizer_matches_student = True
-    trainer.beta = 1.0
-    trainer.temperature = 1.0
-    trainer.reverse_kl_top_1_mode = "sampled"
-    trainer.loss_top_k = 1
-    trainer.loss_add_tail = False
-
-    inputs = {
-        "input_ids": torch.tensor([[0, 0, 10, 11, 12, 20, 21], [30, 31, 32, 33, 34, 40, 41]], dtype=torch.long),
-        "attention_mask": torch.tensor([[0, 0, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1]], dtype=torch.long),
-        "labels": torch.tensor(
-            [[-100, -100, -100, -100, -100, 20, 21], [-100, -100, -100, -100, -100, 40, 41]],
-            dtype=torch.long,
+@pytest.mark.parametrize(
+    (
+        "input_ids",
+        "attention_mask",
+        "prompt_attention_mask",
+        "labels",
+        "expected_sequences",
+        "expected_prompt_lengths",
+    ),
+    [
+        pytest.param(
+            torch.tensor([[0, 0, 10, 11, 12, 20, 21], [30, 31, 32, 33, 34, 40, 41]], dtype=torch.long),
+            torch.tensor([[0, 0, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1]], dtype=torch.long),
+            None,
+            torch.tensor(
+                [[-100, -100, -100, -100, -100, 20, 21], [-100, -100, -100, -100, -100, 40, 41]],
+                dtype=torch.long,
+            ),
+            [[10, 11, 12, 20, 21], [30, 31, 32, 33, 34, 40, 41]],
+            [3, 5],
+            id="variable_prompt_lengths",
         ),
-        "prompts": torch.tensor([[0, 0, 10, 11, 12], [30, 31, 32, 33, 34]], dtype=torch.long),
-        "prompt_attention_mask": torch.tensor([[0, 0, 1, 1, 1], [1, 1, 1, 1, 1]], dtype=torch.long),
-    }
-
-    batch_size, sequence_length = inputs["input_ids"].shape
-    loss = DistillationTrainer.compute_loss(
-        trainer,
-        DummyStudentModel(torch.zeros(batch_size, sequence_length, 64, dtype=torch.float32)),
-        inputs,
-    )
-
-    assert torch.isfinite(loss)
-
-
-def test_server_teacher_path_handles_on_policy_padded_completions():
-    class OnPolicyTeacherClient(DummyTeacherClient):
-        def get_sequence_logprobs(self, sequences, prompt_lengths, top_logprobs, temperature):
-            assert sequences == [[10, 11, 12, 20, 21], [30, 31, 32, 33, 34, 40, 41]]
-            assert prompt_lengths == [3, 5]
-            assert top_logprobs == 1
-            return self.result
-
-    trainer = DistillationTrainer.__new__(DistillationTrainer)
-    trainer.teacher_model = None
-    trainer.teacher_client = OnPolicyTeacherClient(
-        {
-            "actual_logprobs": [[[-0.1], [-0.2]], [[-0.3], [-0.4]]],
-            "logprobs": [[[-0.1], [-0.2]], [[-0.3], [-0.4]]],
-            "logprob_token_ids": [[[20], [21]], [[40], [41]]],
-        }
-    )
-    trainer.use_teacher_server = True
-    trainer.teacher_model_server_url = "http://localhost:8000"
-    trainer.use_liger_loss = False
-    trainer._local_teacher_tokenizer_matches_student = True
-    trainer.beta = 1.0
-    trainer.temperature = 1.0
-    trainer.reverse_kl_top_1_mode = "sampled"
-    trainer.loss_top_k = 1
-    trainer.loss_add_tail = False
-
-    inputs = {
-        "input_ids": torch.tensor(
-            [[0, 0, 10, 11, 12, 20, 21, 0, 0], [30, 31, 32, 33, 34, 40, 41, 0, 0]],
-            dtype=torch.long,
+        pytest.param(
+            torch.tensor(
+                [[0, 0, 10, 11, 12, 20, 21, 0, 0], [30, 31, 32, 33, 34, 40, 41, 0, 0]],
+                dtype=torch.long,
+            ),
+            torch.tensor(
+                [[0, 0, 1, 1, 1, 1, 1, 0, 0], [1, 1, 1, 1, 1, 1, 1, 0, 0]],
+                dtype=torch.long,
+            ),
+            torch.tensor([[0, 0, 1, 1, 1], [1, 1, 1, 1, 1]], dtype=torch.long),
+            torch.tensor(
+                [
+                    [-100, -100, -100, -100, -100, 20, 21, -100, -100],
+                    [-100, -100, -100, -100, -100, 40, 41, -100, -100],
+                ],
+                dtype=torch.long,
+            ),
+            [[10, 11, 12, 20, 21], [30, 31, 32, 33, 34, 40, 41]],
+            [3, 5],
+            id="padded_on_policy_completions",
         ),
-        "attention_mask": torch.tensor(
-            [[0, 0, 1, 1, 1, 1, 1, 0, 0], [1, 1, 1, 1, 1, 1, 1, 0, 0]],
-            dtype=torch.long,
+        pytest.param(
+            torch.tensor([[10, 11, 12]], dtype=torch.long),
+            torch.tensor([[1, 1, 1]], dtype=torch.long),
+            None,
+            torch.tensor([[-100, -100, -100]], dtype=torch.long),
+            [[10, 11, 12]],
+            [3],
+            id="empty_completion",
         ),
-        "labels": torch.tensor(
-            [[-100, -100, -100, -100, -100, 20, 21, -100, -100], [-100, -100, -100, -100, -100, 40, 41, -100, -100]],
-            dtype=torch.long,
-        ),
-        "prompts": torch.tensor([[0, 0, 10, 11, 12], [30, 31, 32, 33, 34]], dtype=torch.long),
-        "prompt_attention_mask": torch.tensor([[0, 0, 1, 1, 1], [1, 1, 1, 1, 1]], dtype=torch.long),
-    }
-
-    batch_size, sequence_length = inputs["input_ids"].shape
-    loss = DistillationTrainer.compute_loss(
-        trainer,
-        DummyStudentModel(torch.zeros(batch_size, sequence_length, 64, dtype=torch.float32)),
-        inputs,
-    )
-
-    assert torch.isfinite(loss)
-
-
-def test_build_teacher_request_inputs_preserves_empty_completions():
+    ],
+)
+def test_build_teacher_request_inputs(
+    input_ids,
+    attention_mask,
+    prompt_attention_mask,
+    labels,
+    expected_sequences,
+    expected_prompt_lengths,
+):
     sequences, prompt_lengths, completion_lengths = build_teacher_request_inputs(
-        input_ids=torch.tensor([[10, 11, 12]], dtype=torch.long),
-        attention_mask=torch.tensor([[1, 1, 1]], dtype=torch.long),
-        labels=torch.tensor([[-100, -100, -100]], dtype=torch.long),
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        prompt_attention_mask=prompt_attention_mask,
+        labels=labels,
     )
 
-    assert sequences == [[10, 11, 12]]
-    assert prompt_lengths == [3]
-    assert completion_lengths == [0]
+    assert sequences == expected_sequences
+    assert prompt_lengths == expected_prompt_lengths
+    assert completion_lengths == [
+        len(sequence) - prompt_length for sequence, prompt_length in zip(sequences, prompt_lengths, strict=True)
+    ]
+
+
+class TestGeneralizedJSDLoss(TrlTestCase):
+    def setup_method(self):
+        self.batch_size = 2
+        self.seq_length = 3
+        self.vocab_size = 5
+        self.student_logits = torch.randn(self.batch_size, self.seq_length, self.vocab_size)
+        self.teacher_logits = torch.randn(self.batch_size, self.seq_length, self.vocab_size)
+
+    def test_uniform_distribution(self):
+        logits = torch.ones(1, 1, self.vocab_size)
+        loss = DistillationTrainer.generalized_jsd_loss(logits, logits)
+        assert round(abs(loss.item() - 0), 5) == 0
+
+    def test_generalized_jsd_loss_edge_cases(self):
+        # Setup
+        student_logits = torch.log(torch.tensor([[0.1, 0.9]])).unsqueeze(0)
+        teacher_logits = torch.log(torch.tensor([[0.9, 0.1]])).unsqueeze(0)
+
+        # Case 1: beta = 1 (should be equivalent to KL(student || teacher))
+        loss_beta_1 = DistillationTrainer.generalized_jsd_loss(student_logits, teacher_logits, beta=1)
+        expected_loss_beta_1 = F.kl_div(
+            F.log_softmax(teacher_logits, dim=-1), F.softmax(student_logits, dim=-1), reduction="batchmean"
+        )
+        assert round(abs(loss_beta_1.item() - expected_loss_beta_1.item()), 5) == 0
+
+        # Case 2: beta = 0 (should be equivalent to KL(teacher || student))
+        loss_beta_0 = DistillationTrainer.generalized_jsd_loss(student_logits, teacher_logits, beta=0)
+        expected_loss_beta_0 = F.kl_div(
+            F.log_softmax(student_logits, dim=-1), F.softmax(teacher_logits, dim=-1), reduction="batchmean"
+        )
+        assert round(abs(loss_beta_0.item() - expected_loss_beta_0.item()), 5) == 0
+
+    def test_output_shape(self):
+        loss = DistillationTrainer.generalized_jsd_loss(self.student_logits, self.teacher_logits)
+        assert torch.is_tensor(loss)
+        assert loss.shape == torch.Size([])
+
+    def test_beta_values(self):
+        loss_beta_0 = DistillationTrainer.generalized_jsd_loss(self.student_logits, self.teacher_logits, beta=0)
+        loss_beta_1 = DistillationTrainer.generalized_jsd_loss(self.student_logits, self.teacher_logits, beta=1)
+        assert loss_beta_0 != loss_beta_1
+
+    def test_temperature_scaling(self):
+        loss_temp_1 = DistillationTrainer.generalized_jsd_loss(
+            self.student_logits, self.teacher_logits, temperature=1
+        )
+        loss_temp_2 = DistillationTrainer.generalized_jsd_loss(
+            self.student_logits, self.teacher_logits, temperature=2
+        )
+        assert loss_temp_1 != loss_temp_2
+
+    def test_reduction_methods(self):
+        loss_batchmean = DistillationTrainer.generalized_jsd_loss(
+            self.student_logits, self.teacher_logits, reduction="batchmean"
+        )
+        loss_sum = DistillationTrainer.generalized_jsd_loss(
+            self.student_logits, self.teacher_logits, reduction="sum"
+        )
+        loss_mean = DistillationTrainer.generalized_jsd_loss(
+            self.student_logits, self.teacher_logits, reduction="mean"
+        )
+        loss_none = DistillationTrainer.generalized_jsd_loss(
+            self.student_logits, self.teacher_logits, reduction="none"
+        )
+
+        assert loss_batchmean.shape == torch.Size([])
+        assert loss_sum.shape == torch.Size([])
+        assert loss_mean.shape == torch.Size([])
+        assert loss_none.shape == self.student_logits.shape
+
+    def test_symmetry(self):
+        student_teacher = DistillationTrainer.generalized_jsd_loss(
+            self.student_logits, self.teacher_logits, beta=0.1
+        )
+        teacher_student = DistillationTrainer.generalized_jsd_loss(
+            self.teacher_logits, self.student_logits, beta=0.1
+        )
+        assert student_teacher != teacher_student
+
+        student_teacher = DistillationTrainer.generalized_jsd_loss(
+            self.student_logits, self.teacher_logits, beta=0.5
+        )
+        teacher_student = DistillationTrainer.generalized_jsd_loss(
+            self.teacher_logits, self.student_logits, beta=0.5
+        )
+        assert student_teacher == teacher_student
+
+    def test_zero_loss_for_identical_inputs(self):
+        identical_logits = torch.randn(self.batch_size, self.seq_length, self.vocab_size)
+        loss = DistillationTrainer.generalized_jsd_loss(identical_logits, identical_logits)
+        assert round(abs(loss.item() - 0), 6) == 0
+
+
+class TestDistillationTrainer(TrlTestCase):
+    def setup_method(self):
+        self.model_id = "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5"
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_id)
+        self.tokenizer.pad_token = self.tokenizer.eos_token
+
+    def _make_args(self, **kwargs):
+        args = {
+            "output_dir": self.tmp_dir,
+            "per_device_train_batch_size": 2,
+            "gradient_accumulation_steps": 1,
+            "max_steps": 1,
+            "save_strategy": "no",
+            "report_to": "none",
+            "disable_tqdm": True,
+            "use_cpu": True,
+            "bf16": False,
+            "lmbda": 0.0,
+            "max_length": 128,
+            "max_completion_length": 32,
+            "model_init_kwargs": {"dtype": "float32", "device_map": None},
+            "teacher_model_init_kwargs": {"dtype": "float32", "device_map": None},
+        }
+        args.update(kwargs)
+        return DistillationConfig(**args)
+
+    def _make_local_trainer(self, **kwargs):
+        dummy_dataset = load_dataset("trl-internal-testing/zen", "conversational_language_modeling")
+        return DistillationTrainer(
+            model=self.model_id,
+            teacher_model=self.model_id,
+            args=self._make_args(**kwargs),
+            train_dataset=dummy_dataset["train"],
+            processing_class=self.tokenizer,
+        )
+
+    def _make_server_trainer(self, **kwargs):
+        dummy_dataset = load_dataset("trl-internal-testing/zen", "conversational_language_modeling")
+        return DistillationTrainer(
+            model=self.model_id,
+            teacher_model=None,
+            args=self._make_args(use_teacher_server=True, teacher_model_server_url="http://localhost:8000", **kwargs),
+            train_dataset=dummy_dataset["train"],
+            processing_class=self.tokenizer,
+        )
+
+    def _make_batch(self, trainer):
+        examples = [trainer.train_dataset[i] for i in range(2)]
+        return trainer.data_collator(examples)
+
+    @staticmethod
+    def _move_batch_to_device(batch, device):
+        return {key: value.to(device) for key, value in batch.items()}
+
+    def test_distillation_trainer_train_runs_with_local_teacher(self):
+        training_args = self._make_args(
+            dataloader_drop_last=True,
+            eval_strategy="steps",
+            max_steps=4,
+            eval_steps=2,
+            save_strategy="steps",
+            save_steps=2,
+            per_device_eval_batch_size=2,
+        )
+        dummy_dataset = load_dataset("trl-internal-testing/zen", "conversational_language_modeling")
+        trainer = DistillationTrainer(
+            model=self.model_id,
+            teacher_model=self.model_id,
+            args=training_args,
+            train_dataset=dummy_dataset["train"],
+            eval_dataset=dummy_dataset["test"],
+            processing_class=self.tokenizer,
+        )
+
+        train_result = trainer.train()
+
+        assert trainer.state.log_history[-1]["train_loss"] is not None
+        assert trainer.state.log_history[0]["eval_loss"] is not None
+        assert train_result.metrics["train_loss"] >= 0.0
+        assert "model.safetensors" in os.listdir(self.tmp_dir + "/checkpoint-2")
+
+    @require_liger_kernel
+    @pytest.mark.xfail(reason="Computing the Liger loss spikes GPU memory usage, causing the test to run OOM.")
+    def test_distillation_trainer_with_liger(self):
+        training_args = self._make_args(
+            use_liger_kernel=True,
+        )
+        dummy_dataset = load_dataset("trl-internal-testing/zen", "conversational_language_modeling")
+
+        trainer = DistillationTrainer(
+            model=self.model_id,
+            teacher_model=self.model_id,
+            args=training_args,
+            train_dataset=dummy_dataset["train"],
+            processing_class=self.tokenizer,
+        )
+
+        # Ensure liger fused JSD path is enabled; if not, skip (runtime may lack system libs)
+        if not getattr(trainer, "use_liger_loss", False):
+            pytest.skip("Liger fused JSD not enabled at runtime; skipping fused-loss assertion")
+
+        trainer.train()
+
+        # Check we logged a train loss
+        assert trainer.state.log_history[-1]["train_loss"] is not None
+
+    def test_sampled_mode_matches_between_local_and_external_teachers(self, monkeypatch):
+        import trl.generation.vllm_client as vllm_client_module
+
+        teacher_client = RecordingTeacherClient()
+        monkeypatch.setattr(vllm_client_module, "VLLMClient", lambda *args, **kwargs: teacher_client)
+
+        local_trainer = self._make_local_trainer(beta=0.5, loss_top_k=1, reverse_kl_top_1_mode="sampled")
+        server_trainer = self._make_server_trainer(beta=0.5, loss_top_k=1)
+
+        cpu_inputs = self._make_batch(local_trainer)
+        expected_sequences, expected_prompt_lengths, _ = build_teacher_request_inputs(
+            cpu_inputs["input_ids"],
+            cpu_inputs["attention_mask"],
+            prompt_attention_mask=cpu_inputs["prompt_attention_mask"],
+            labels=cpu_inputs["labels"],
+        )
+
+        local_inputs = self._move_batch_to_device(cpu_inputs, local_trainer.accelerator.device)
+        server_inputs = self._move_batch_to_device(cpu_inputs, server_trainer.accelerator.device)
+
+        local_trainer.teacher_model.eval()
+        with torch.no_grad():
+            teacher_logits = local_trainer.teacher_model(
+                input_ids=local_inputs["input_ids"],
+                attention_mask=local_inputs["attention_mask"],
+            ).logits
+            teacher_client.result = _build_server_result(
+                teacher_logits,
+                local_inputs,
+                temperature=local_trainer.temperature,
+            )
+            local_loss = local_trainer.compute_loss(local_trainer.model, local_inputs)
+            server_loss = server_trainer.compute_loss(server_trainer.model, server_inputs)
+
+        assert teacher_client.calls[0]["sequences"] == expected_sequences
+        assert teacher_client.calls[0]["prompt_lengths"] == expected_prompt_lengths
+        assert teacher_client.calls[0]["top_logprobs"] == 1
+        torch.testing.assert_close(local_loss, server_loss)
 
 
 def test_repeat_batch_dataloader_delegates_set_epoch_via_getattr():
