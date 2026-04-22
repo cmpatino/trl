@@ -116,6 +116,7 @@ def test_distillation_config_requires_teacher_server_url(tmp_path):
         "labels",
         "expected_sequences",
         "expected_prompt_lengths",
+        "expected_completion_lengths",
     ),
     [
         pytest.param(
@@ -128,6 +129,7 @@ def test_distillation_config_requires_teacher_server_url(tmp_path):
             ),
             [[10, 11, 12, 20, 21], [30, 31, 32, 33, 34, 40, 41]],
             [3, 5],
+            [2, 2],
             id="variable_prompt_lengths",
         ),
         pytest.param(
@@ -149,6 +151,7 @@ def test_distillation_config_requires_teacher_server_url(tmp_path):
             ),
             [[10, 11, 12, 20, 21], [30, 31, 32, 33, 34, 40, 41]],
             [3, 5],
+            [2, 2],
             id="padded_on_policy_completions",
         ),
         pytest.param(
@@ -158,6 +161,7 @@ def test_distillation_config_requires_teacher_server_url(tmp_path):
             torch.tensor([[-100, -100, -100]], dtype=torch.long),
             [[10, 11, 12]],
             [3],
+            [0],
             id="empty_completion",
         ),
     ],
@@ -169,6 +173,7 @@ def test_build_teacher_request_inputs(
     labels,
     expected_sequences,
     expected_prompt_lengths,
+    expected_completion_lengths,
 ):
     sequences, prompt_lengths, completion_lengths = build_teacher_request_inputs(
         input_ids=input_ids,
@@ -179,9 +184,7 @@ def test_build_teacher_request_inputs(
 
     assert sequences == expected_sequences
     assert prompt_lengths == expected_prompt_lengths
-    assert completion_lengths == [
-        len(sequence) - prompt_length for sequence, prompt_length in zip(sequences, prompt_lengths, strict=True)
-    ]
+    assert completion_lengths == expected_completion_lengths
 
 
 class TestGeneralizedJSDLoss(TrlTestCase):
