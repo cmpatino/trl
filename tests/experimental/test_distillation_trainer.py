@@ -23,7 +23,7 @@ from transformers import AutoTokenizer
 from trl.experimental.distillation import DistillationConfig, DistillationTrainer
 from trl.experimental.distillation.distillation_trainer import _RepeatBatchDataLoader, build_teacher_request_inputs
 
-from ..testing_utils import TrlTestCase, require_liger_kernel
+from ..testing_utils import TrlTestCase, require_liger_kernel, require_torch_accelerator
 
 
 def _make_distillation_config_kwargs(tmp_path):
@@ -227,21 +227,15 @@ class TestGeneralizedJSDLoss(TrlTestCase):
         assert loss_beta_0 != loss_beta_1
 
     def test_temperature_scaling(self):
-        loss_temp_1 = DistillationTrainer.generalized_jsd_loss(
-            self.student_logits, self.teacher_logits, temperature=1
-        )
-        loss_temp_2 = DistillationTrainer.generalized_jsd_loss(
-            self.student_logits, self.teacher_logits, temperature=2
-        )
+        loss_temp_1 = DistillationTrainer.generalized_jsd_loss(self.student_logits, self.teacher_logits, temperature=1)
+        loss_temp_2 = DistillationTrainer.generalized_jsd_loss(self.student_logits, self.teacher_logits, temperature=2)
         assert loss_temp_1 != loss_temp_2
 
     def test_reduction_methods(self):
         loss_batchmean = DistillationTrainer.generalized_jsd_loss(
             self.student_logits, self.teacher_logits, reduction="batchmean"
         )
-        loss_sum = DistillationTrainer.generalized_jsd_loss(
-            self.student_logits, self.teacher_logits, reduction="sum"
-        )
+        loss_sum = DistillationTrainer.generalized_jsd_loss(self.student_logits, self.teacher_logits, reduction="sum")
         loss_mean = DistillationTrainer.generalized_jsd_loss(
             self.student_logits, self.teacher_logits, reduction="mean"
         )
@@ -255,20 +249,12 @@ class TestGeneralizedJSDLoss(TrlTestCase):
         assert loss_none.shape == self.student_logits.shape
 
     def test_symmetry(self):
-        student_teacher = DistillationTrainer.generalized_jsd_loss(
-            self.student_logits, self.teacher_logits, beta=0.1
-        )
-        teacher_student = DistillationTrainer.generalized_jsd_loss(
-            self.teacher_logits, self.student_logits, beta=0.1
-        )
+        student_teacher = DistillationTrainer.generalized_jsd_loss(self.student_logits, self.teacher_logits, beta=0.1)
+        teacher_student = DistillationTrainer.generalized_jsd_loss(self.teacher_logits, self.student_logits, beta=0.1)
         assert student_teacher != teacher_student
 
-        student_teacher = DistillationTrainer.generalized_jsd_loss(
-            self.student_logits, self.teacher_logits, beta=0.5
-        )
-        teacher_student = DistillationTrainer.generalized_jsd_loss(
-            self.teacher_logits, self.student_logits, beta=0.5
-        )
+        student_teacher = DistillationTrainer.generalized_jsd_loss(self.student_logits, self.teacher_logits, beta=0.5)
+        teacher_student = DistillationTrainer.generalized_jsd_loss(self.teacher_logits, self.student_logits, beta=0.5)
         assert student_teacher == teacher_student
 
     def test_zero_loss_for_identical_inputs(self):
@@ -359,11 +345,11 @@ class TestDistillationTrainer(TrlTestCase):
         assert "model.safetensors" in os.listdir(self.tmp_dir + "/checkpoint-2")
 
     @require_liger_kernel
-    @pytest.mark.xfail(reason="Computing the Liger loss spikes GPU memory usage, causing the test to run OOM.")
+    @require_torch_accelerator
     def test_distillation_trainer_with_liger(self):
-        training_args = self._make_args(
-            use_liger_kernel=True,
-        )
+        import importlib
+
+        training_args = self._make_args(use_liger_kernel=True, use_cpu=False)
         dummy_dataset = load_dataset("trl-internal-testing/zen", "conversational_language_modeling")
 
         trainer = DistillationTrainer(
@@ -374,14 +360,12 @@ class TestDistillationTrainer(TrlTestCase):
             processing_class=self.tokenizer,
         )
 
-        # Ensure liger fused JSD path is enabled; if not, skip (runtime may lack system libs)
-        if not getattr(trainer, "use_liger_loss", False):
-            pytest.skip("Liger fused JSD not enabled at runtime; skipping fused-loss assertion")
-
-        trainer.train()
-
-        # Check we logged a train loss
-        assert trainer.state.log_history[-1]["train_loss"] is not None
+        try:
+            assert trainer.use_liger_loss is True
+            trainer.train()
+            assert trainer.state.log_history[-1]["train_loss"] is not None
+        finally:
+            importlib.reload(importlib.import_module(trainer.model.__module__))
 
     def test_sampled_mode_matches_between_local_and_external_teachers(self, monkeypatch):
         import trl.generation.vllm_client as vllm_client_module
