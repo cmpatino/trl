@@ -31,17 +31,43 @@ def _make_distillation_config_kwargs(tmp_path):
 
 
 def _build_server_result(teacher_logits, inputs, temperature=1.0):
-    prompt_length = int((inputs["attention_mask"].sum(dim=1) - (inputs["labels"] != -100).sum(dim=1)).min().item())
-    teacher_logits = teacher_logits[:, prompt_length - 1 : -1, :]
-    teacher_log_probs = F.log_softmax(teacher_logits / temperature, dim=-1)
-    completion_tokens = inputs["input_ids"][:, prompt_length:]
-    teacher_top1_token_ids = teacher_logits.argmax(dim=-1, keepdim=True)
-    teacher_top1_logprobs = teacher_log_probs.gather(dim=-1, index=teacher_top1_token_ids)
-    actual_teacher_logprobs = teacher_log_probs.gather(dim=-1, index=completion_tokens.unsqueeze(-1))
+    """Simulate a vLLM server response with variable-length per-sample completions."""
+    _, _, completion_lengths = build_teacher_request_inputs(
+        inputs["input_ids"],
+        inputs["attention_mask"],
+        prompt_attention_mask=inputs.get("prompt_attention_mask"),
+        labels=inputs.get("labels"),
+    )
+
+    label_mask = inputs["labels"] != -100
+    actual_logprobs = []
+    logprobs = []
+    logprob_token_ids = []
+
+    for i, comp_len in enumerate(completion_lengths):
+        if comp_len == 0:
+            actual_logprobs.append([])
+            logprobs.append([])
+            logprob_token_ids.append([])
+            continue
+
+        comp_start = int(torch.nonzero(label_mask[i], as_tuple=False)[0].item())
+        sample_logits = teacher_logits[i, comp_start - 1 : comp_start - 1 + comp_len, :]
+        sample_log_probs = F.log_softmax(sample_logits / temperature, dim=-1)
+        comp_tokens = inputs["input_ids"][i, comp_start : comp_start + comp_len]
+
+        top1_ids = sample_logits.argmax(dim=-1, keepdim=True)
+        top1_lps = sample_log_probs.gather(dim=-1, index=top1_ids)
+        actual_lps = sample_log_probs.gather(dim=-1, index=comp_tokens.unsqueeze(-1))
+
+        actual_logprobs.append(actual_lps.tolist())
+        logprobs.append(top1_lps.tolist())
+        logprob_token_ids.append(top1_ids.tolist())
+
     return {
-        "actual_logprobs": actual_teacher_logprobs.tolist(),
-        "logprobs": teacher_top1_logprobs.tolist(),
-        "logprob_token_ids": teacher_top1_token_ids.tolist(),
+        "actual_logprobs": actual_logprobs,
+        "logprobs": logprobs,
+        "logprob_token_ids": logprob_token_ids,
     }
 
 
