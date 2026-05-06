@@ -323,34 +323,6 @@ class _DistillationCollator:
         }
 
 
-class _RepeatBatchDataLoader:
-    """Repeats each collated batch ``repeat_count`` times without re-collation.
-
-    ``RepeatSampler`` with ``repeat_count > 1`` causes the DataLoader to re-collate (re-tokenize) the same examples on
-    every repeat, which is wasteful. This wrapper instead keeps ``repeat_count=1`` in the sampler and repeats the
-    already-collated tensor dict, avoiding redundant tokenization.
-    """
-
-    def __init__(self, dataloader, repeat_count: int):
-        self.dataloader = dataloader
-        self.repeat_count = repeat_count
-
-    def __iter__(self):
-        for batch in self.dataloader:
-            for _ in range(self.repeat_count):
-                yield batch
-
-    def __len__(self):
-        return len(self.dataloader) * self.repeat_count
-
-    def set_epoch(self, epoch: int):
-        if hasattr(self.dataloader, "set_epoch"):
-            self.dataloader.set_epoch(epoch)
-
-    def __getattr__(self, attr):
-        return getattr(self.dataloader, attr)
-
-
 class DistillationTrainer(_BaseTrainer):
     """
     Trainer for knowledge distillation from a teacher model to a student model.
@@ -709,11 +681,16 @@ class DistillationTrainer(_BaseTrainer):
     def _get_train_sampler(self, dataset=None):
         if dataset is None:
             dataset = self.train_dataset
+        # ``repeat_count=gradient_accumulation_steps`` replays each generation batch across the accumulation window so
+        # the same unique prompts are seen once per optimizer step. Pushing the repetition into the sampler (rather
+        # than wrapping the dataloader) keeps the dataloader's batch count aligned with ``max_steps *
+        # gradient_accumulation_steps``, which is required for ``Trainer``'s ``skip_first_batches`` resume path to
+        # land on the correct batch.
         return RepeatSampler(
             data_source=dataset,
             mini_repeat_count=self.num_generations,
             batch_size=self.args.generation_batch_size * self.accelerator.num_processes,
-            repeat_count=1,
+            repeat_count=self.args.gradient_accumulation_steps,
             shuffle=True,
             seed=self.args.seed,
         )
@@ -722,9 +699,10 @@ class DistillationTrainer(_BaseTrainer):
         """
         Override to load one generation batch per optimizer window.
 
-        The dataloader yields batches of size `per_device_train_batch_size * gradient_accumulation_steps`.
-        RepeatSampler ensures each generation batch is repeated `gradient_accumulation_steps` times so the Trainer's
-        loop iterates the correct number of times.
+        The dataloader yields batches of size `per_device_train_batch_size * gradient_accumulation_steps`, and the
+        sampler's `repeat_count=gradient_accumulation_steps` replays each batch across the accumulation window. This
+        keeps `len(dataloader) == max_steps * gradient_accumulation_steps`, matching what `Trainer` assumes when
+        skipping batches on resume from checkpoint.
         """
         if self.train_dataset is None:
             raise ValueError("Trainer: training requires a train_dataset.")
@@ -751,8 +729,7 @@ class DistillationTrainer(_BaseTrainer):
             if self.args.dataloader_num_workers > 0:
                 dataloader_params["prefetch_factor"] = self.args.dataloader_prefetch_factor
 
-        base_dataloader = self.accelerator.prepare(DataLoader(train_dataset, **dataloader_params))
-        return _RepeatBatchDataLoader(base_dataloader, repeat_count=self.args.gradient_accumulation_steps)
+        return self.accelerator.prepare(DataLoader(train_dataset, **dataloader_params))
 
     # ──────────────────────────────────────────────────────────────────────
     #  Buffering: on/off-policy mixing across gradient accumulation steps
