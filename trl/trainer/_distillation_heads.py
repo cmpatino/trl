@@ -19,6 +19,8 @@ Shared seam between the teacher registry/executor (`_distillation_teacher.py`), 
 `/data/workspaces/mopd/implementation/interfaces.md` for the contract.
 """
 
+import threading
+import time
 from dataclasses import dataclass
 
 import torch
@@ -59,3 +61,214 @@ class TargetGroup:
     teacher_index: int
     hidden: torch.Tensor
     positions: torch.Tensor
+
+
+@dataclass
+class HeadCacheStats:
+    """Counters for [`TeacherHeadCache`]; `bytes`/`seconds` cover the device transfers it performs.
+
+    `hits`/`misses` count projection leases served by the resident slot and leases that had to (re)upload a head;
+    checkpoint replay adds to them, so they are cache statistics rather than training metrics.
+    """
+
+    uploads: int = 0
+    hits: int = 0
+    misses: int = 0
+    bytes_uploaded: int = 0
+    upload_seconds: float = 0.0
+    live_head_bytes: int = 0
+    peak_head_bytes: int = 0
+
+
+@dataclass
+class LeasedHead:
+    """Device head tensors valid for the duration of one [`TeacherHeadCache.projection_lease`] block.
+
+    `bias` stays in the source dtype: the loss adds `bias.float()` after upcasting the projection, so rounding it
+    through the execution dtype would change the arithmetic.
+    """
+
+    weight: torch.Tensor
+    bias: torch.Tensor | None
+
+
+class _ProjectionLease:
+    """Context manager returned by [`TeacherHeadCache.projection_lease`]."""
+
+    def __init__(self, cache: "TeacherHeadCache", key: tuple):
+        self._cache = cache
+        self._key = key
+
+    def __enter__(self) -> LeasedHead:
+        return self._cache._acquire(self._key)
+
+    def __exit__(self, exc_type, exc_value, traceback) -> bool:
+        self._cache._release()
+        # Falsy: checkpoint early-stop and application exceptions must propagate out of the chunk body.
+        return False
+
+
+class TeacherHeadCache:
+    """
+    One device head slot serving every teacher identity registered on a rank.
+
+    Head sources are exact CPU tensors retained by the executor; the device copy is disposable. A projection lease
+    uploads the requested head into the single slot, keeping it for reuse until another identity is requested, so a
+    replay of the checkpointed loss re-acquires the exact head it projected in the forward pass without a second head
+    ever being resident. Switching identities finishes outstanding device work and drops the old storage before
+    allocating the replacement. Transfers go through one reused pinned staging tile on CUDA and block until complete
+    (`non_blocking=False`), so a tile is never rewritten before its copy finishes. All bookkeeping is serialized by one
+    lock because autograd worker threads acquire leases during checkpoint replay; a request for a different identity
+    waits until the active leases drain rather than breaking the one-head bound.
+
+    On CPU the "upload" is a dtype-cast copy, so hit/miss/eviction accounting stays observable without an accelerator.
+
+    Args:
+        device (`torch.device`):
+            Device the projections run on. One cache instance serves one device.
+        staging_bytes (`int`, *optional*, defaults to `64 << 20`):
+            Size of the pinned staging tile used for CUDA uploads. Heads larger than the tile are copied in several
+            blocking tiles.
+    """
+
+    def __init__(self, device: torch.device, staging_bytes: int = 64 << 20):
+        self.device = torch.device(device)
+        self.stats = HeadCacheStats()
+        self._staging_bytes = staging_bytes
+        self._sources: dict[HeadIdentity, HeadSource] = {}
+        self._key: tuple | None = None
+        self._weight: torch.Tensor | None = None
+        self._bias: torch.Tensor | None = None
+        self._leases = 0
+        self._staging: torch.Tensor | None = None
+        self._closed = False
+        self._lock = threading.Lock()
+        self._idle = threading.Condition(self._lock)
+
+    def retain_head_source(self, source: HeadSource) -> None:
+        """
+        Register the exact CPU head tensors for an identity; idempotent per identity.
+
+        Args:
+            source ([`HeadSource`]):
+                CPU weight/bias to project through while any target using this identity is live.
+        """
+        with self._lock:
+            self._sources.setdefault(source.identity, source)
+
+    def release_head_source(self, identity: HeadIdentity) -> None:
+        """
+        Drop the CPU head source, and the device slot when it holds this identity.
+
+        Args:
+            identity ([`HeadIdentity`]):
+                Identity whose source is no longer needed by any live target.
+        """
+        with self._lock:
+            if self._key is not None and self._key[0] == identity and self._leases:
+                raise RuntimeError(f"cannot release head source {identity.teacher_id!r} while a lease is active")
+            if self._key is not None and self._key[0] == identity:
+                self._free_slot()
+            self._sources.pop(identity, None)
+
+    def projection_lease(self, identity: HeadIdentity, execution_dtype: torch.dtype) -> _ProjectionLease:
+        """
+        Lease the device head for one projection.
+
+        Args:
+            identity ([`HeadIdentity`]):
+                Teacher head to project through; its source must be retained.
+            execution_dtype (`torch.dtype`):
+                Dtype the weight is materialized in, i.e. the dtype the projection matmul executes in. Part of the
+                cache key, so alternating dtypes count as misses.
+
+        Returns:
+            `ContextManager[`[`LeasedHead`]`]`: yields the device tensors; the block must not store them.
+        """
+        return _ProjectionLease(self, (identity, self.device, execution_dtype))
+
+    def evict_idle_gpu(self) -> None:
+        """Free the device slot when no lease is active, after outstanding device work completes."""
+        with self._lock:
+            if self._leases == 0:
+                self._free_slot()
+
+    def close(self) -> None:
+        """Free the device slot, the staging tile and all head sources; idempotent."""
+        with self._lock:
+            if self._leases:
+                raise RuntimeError(f"cannot close the head cache while {self._leases} lease(s) are active")
+            self._free_slot()
+            self._sources.clear()
+            self._staging = None
+            self._closed = True
+
+    def _acquire(self, key: tuple) -> LeasedHead:
+        with self._idle:
+            if self._closed:
+                raise RuntimeError("the head cache is closed")
+            # One slot: a different identity/dtype waits for the resident head's leases to drain instead of
+            # allocating a second head.
+            while self._leases and self._key != key:
+                self._idle.wait()
+            if self._key == key:
+                self.stats.hits += 1
+            else:
+                self.stats.misses += 1
+                self._free_slot()
+                self._upload(key)
+            self._leases += 1
+            return LeasedHead(self._weight, self._bias)
+
+    def _release(self) -> None:
+        with self._idle:
+            self._leases -= 1
+            self._idle.notify_all()
+
+    def _free_slot(self) -> None:
+        if self._weight is None:
+            return
+        if self.device.type == "cuda":
+            # Finish the work reading the head before its storage is dropped.
+            torch.cuda.synchronize(self.device)
+        self.stats.live_head_bytes -= _head_bytes(self._weight, self._bias)
+        self._key = self._weight = self._bias = None
+
+    def _upload(self, key: tuple) -> None:
+        identity, _, execution_dtype = key
+        source = self._sources[identity]
+        start = time.perf_counter()
+        weight = self._staged_copy(source.weight, execution_dtype)
+        # The bias keeps its source dtype and is vocabulary-sized, so it goes straight over without a staging tile.
+        bias = None if source.bias is None else source.bias.to(device=self.device, copy=True)
+        self.stats.upload_seconds += time.perf_counter() - start
+        self.stats.uploads += 1
+        self.stats.bytes_uploaded += _head_bytes(weight, bias)
+        self.stats.live_head_bytes += _head_bytes(weight, bias)
+        self.stats.peak_head_bytes = max(self.stats.peak_head_bytes, self.stats.live_head_bytes)
+        self._key, self._weight, self._bias = key, weight, bias
+
+    def _staged_copy(self, source: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        # The destination owns its storage even when no cast is needed, so eviction is observable on CPU too.
+        out = torch.empty(source.shape, dtype=dtype, device=self.device)
+        flat_source, flat_out = source.reshape(-1), out.reshape(-1)
+        tile = self._staging_tile(dtype)
+        for start in range(0, flat_source.numel(), tile.numel()):
+            elements = min(tile.numel(), flat_source.numel() - start)
+            tile[:elements].copy_(flat_source[start : start + elements])  # host-side cast into the tile
+            flat_out[start : start + elements].copy_(tile[:elements], non_blocking=False)  # completes before reuse
+        return out
+
+    def _staging_tile(self, dtype: torch.dtype) -> torch.Tensor:
+        if self._staging is None or self._staging.dtype != dtype:
+            elements = max(1, self._staging_bytes // torch.empty((), dtype=dtype).element_size())
+            self._staging = None  # drop the previous tile before allocating the replacement
+            self._staging = torch.empty(elements, dtype=dtype, pin_memory=self.device.type == "cuda")
+        return self._staging
+
+
+def _head_bytes(weight: torch.Tensor, bias: torch.Tensor | None) -> int:
+    total = weight.numel() * weight.element_size()
+    if bias is not None:
+        total += bias.numel() * bias.element_size()
+    return total
