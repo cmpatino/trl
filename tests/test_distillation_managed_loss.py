@@ -22,6 +22,7 @@ import contextlib
 import gc
 import threading
 import time
+import warnings
 import weakref
 from dataclasses import dataclass, field
 
@@ -835,6 +836,20 @@ class TestManagedLossLifecycle(TrlTestCase):
             assert grad is not None
             assert torch.equal(grad, torch.zeros_like(grad))
         assert cache.stats.uploads == 0  # no teacher head is needed at all
+        cache.close()
+
+    def test_evaluation_forward_under_no_grad(self):
+        # Evaluation calls the loss inside the trainer's no-grad context: the checkpointed chunks must still run,
+        # release their lease and report metrics, without warning about inputs that need no gradient.
+        case = _case(K=8, widths=(8, 5))
+        cache = _cache(case)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with torch.no_grad():
+                outputs, _ = _managed(case, cache, beta=0.5, chunk_size=4, backward=False)
+        assert torch.isfinite(outputs[0]) and not outputs[0].requires_grad
+        assert int(outputs[2].item()) == case.n_valid
+        assert cache._leases == 0
         cache.close()
 
     def test_zero_row_microbatch_raises(self):
