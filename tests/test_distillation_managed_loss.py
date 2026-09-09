@@ -496,3 +496,153 @@ class TestManagedLossPrecision(TrlTestCase):
         torch.testing.assert_close(two_stage, spec.weight.to(torch.float16).to(torch.bfloat16), atol=0, rtol=0)
         assert not torch.equal(direct, two_stage)
         cache.close()
+
+
+class TestHeadCacheLeases(TrlTestCase):
+    """Ownership of the single device head slot: invalidation, refusals, hit/miss accounting, thread safety."""
+
+    def test_lease_bundle_is_invalidated_on_exit(self):
+        # A `with ... as head` binding outlives its block; if the bundle still owned the tensors, eviction could not
+        # free the head.
+        case = _case()
+        cache = _cache(case)
+        with cache.projection_lease(case.specs[0].identity, torch.float32) as head:
+            leased = weakref.ref(head.weight)
+            assert head.weight is not None and head.bias is not None
+        assert head.weight is None and head.bias is None
+        assert leased() is not None  # still held by the cache slot, and reusable by the next lease
+        cache.evict_idle_gpu()
+        gc.collect()
+        assert cache.stats.live_head_bytes == 0
+        assert cache._weight is None and cache._bias is None
+        assert leased() is None
+        cache.close()
+
+    def test_lease_exit_is_falsy_and_never_suppresses(self):
+        case = _case()
+        cache = _cache(case)
+        identity = case.specs[0].identity
+        lease = cache.projection_lease(identity, torch.float32)
+        lease.__enter__()
+        assert lease.__exit__(None, None, None) is False
+        lease = cache.projection_lease(identity, torch.float32)
+        lease.__enter__()
+        # Checkpoint early-stop arrives as an exception through `__exit__`: it must not be swallowed.
+        assert lease.__exit__(RuntimeError, RuntimeError("early stop"), None) is False
+        with pytest.raises(RuntimeError, match="from the block"):
+            with cache.projection_lease(identity, torch.float32):
+                raise RuntimeError("raised from the block")
+        assert cache._leases == 0
+        cache.close()
+
+    def test_release_and_close_refuse_active_leases(self):
+        case = _case()
+        cache = _cache(case)
+        identity = case.specs[0].identity
+        with cache.projection_lease(identity, torch.float32):
+            with pytest.raises(RuntimeError, match="while a lease is active"):
+                cache.release_head_source(identity)
+            with pytest.raises(RuntimeError, match="lease"):
+                cache.close()
+            cache.evict_idle_gpu()  # a no-op while the head is leased
+            assert cache._weight is not None
+        cache.release_head_source(identity)
+        assert cache._weight is None and cache.stats.live_head_bytes == 0
+        cache.close()
+        cache.close()  # idempotent
+        with pytest.raises(RuntimeError, match="closed"):
+            with cache.projection_lease(identity, torch.float32):
+                pass
+
+    def test_alternating_identities_miss_and_repeats_hit(self):
+        case = _case(widths=(8, 5))
+        cache = _cache(case)
+        first, second = (spec.identity for spec in case.specs)
+        for identity in (first, first, second, second, first):
+            with cache.projection_lease(identity, torch.float32):
+                pass
+        assert (cache.stats.misses, cache.stats.hits) == (3, 2)
+        assert cache.stats.uploads == 3
+        cache.close()
+
+    def test_threaded_head_switching_never_holds_two_heads(self):
+        # Autograd worker threads acquire leases during replay: two threads alternating identities must serialize
+        # on the single slot rather than each getting a head.
+        case = _case(widths=(8, 5))
+        cache = _cache(case)
+        errors = []
+
+        def worker(spec):
+            try:
+                for _ in range(40):
+                    with cache.projection_lease(spec.identity, torch.float32) as head:
+                        if not torch.equal(head.weight, spec.weight):
+                            errors.append(f"{spec.teacher_id}: leased the wrong head")
+                        time.sleep(0)  # widen the interleaving window
+            except Exception as exc:  # noqa: BLE001 - reported through `errors` so the assertions below see it
+                errors.append(repr(exc))
+
+        threads = [threading.Thread(target=worker, args=(spec,)) for spec in case.specs]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        assert not any(thread.is_alive() for thread in threads)
+        assert not errors
+        assert cache._leases == 0
+        largest = max(spec.weight.numel() * 4 + spec.bias.numel() * 4 for spec in case.specs)
+        assert cache.stats.peak_head_bytes == largest  # two heads were never resident at once
+        assert cache.stats.misses >= 2
+        cache.close()
+
+    def test_tiny_staging_tile_forces_several_tiles(self):
+        case = _case()
+        spec = case.specs[0]
+        cache = _cache(case, staging_bytes=16)  # four float32 elements per tile
+        assert spec.weight.numel() > 4
+        with cache.projection_lease(spec.identity, torch.float32) as head:
+            assert torch.equal(head.weight, spec.weight)
+        assert cache._staging.numel() == 4
+        with cache.projection_lease(spec.identity, torch.bfloat16, torch.float32) as head:
+            assert torch.equal(head.weight, spec.weight.to(torch.bfloat16))
+        assert cache._staging.numel() == 8  # resized for the narrower dtype, still exactly one tile
+        cache.close()
+        assert cache._staging is None
+
+    def test_tiny_staging_tile_keeps_the_loss_correct(self):
+        case = _case(K=8, widths=(8, 5))
+        cache = _cache(case, staging_bytes=16)
+        _assert_parity(
+            _managed(case, cache, beta=0.5, chunk_size=4),
+            _legacy(case, beta=0.5, chunk_size=4, denom=case.n_valid),
+        )
+        cache.close()
+
+    @require_torch_accelerator
+    def test_staging_tile_is_pinned_on_accelerator(self):
+        """Not observable on CPU: the staging tile is pinned only for device transfers."""
+        case = _case()
+        cache = _cache(case, device=torch_device, staging_bytes=1 << 12)
+        with cache.projection_lease(case.specs[0].identity, torch.float32) as head:
+            assert head.weight.device.type == torch.device(torch_device).type
+            assert torch.equal(head.weight.cpu(), case.specs[0].weight)
+        assert cache._staging.is_pinned()
+        cache.close()
+
+    @require_torch_accelerator
+    def test_one_head_resident_on_accelerator(self):
+        """Not observable on CPU: the device allocation peak across head switches must fit a single head.
+
+        The head is leased in the execution dtype, so the peak also covers what an implicit autocast conversion
+        would have added on top of a cached head in the operand dtype.
+        """
+        case = _case(V=512, widths=(64, 64))
+        cache = _cache(case, device=torch_device)
+        torch.accelerator.reset_peak_memory_stats(torch_device)
+        baseline = torch.accelerator.max_memory_allocated(torch_device)
+        for spec in list(case.specs) * 3:
+            with cache.projection_lease(spec.identity, torch.bfloat16, torch.float32) as head:
+                assert head.weight.dtype == torch.bfloat16
+        one_head = case.specs[0].weight.numel() * 2 + case.specs[0].bias.numel() * 4
+        assert torch.accelerator.max_memory_allocated(torch_device) - baseline < 2 * one_head
+        cache.close()
