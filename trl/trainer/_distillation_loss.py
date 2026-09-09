@@ -28,6 +28,31 @@ from ._distillation_heads import TargetGroup, TeacherHeadCache
 from .utils import maybe_gather_lm_head_ctx
 
 
+def _execution_dtype(hidden_dtype: torch.dtype, device: torch.device) -> torch.dtype:
+    """
+    Dtype the teacher projection's matmul really executes in, so the cached head is materialized in exactly it.
+
+    The baseline matches the head weight to the hidden states' dtype and lets autocast take it from there. Under
+    autocast the matmul therefore runs in the autocast dtype, and a head cached in the hidden states' dtype would be
+    converted implicitly on every matmul — a second full head next to the cached one, defeating the one-head bound.
+    Casting the source straight to the value returned here reproduces the baseline's rounding: the intermediate
+    `source -> hidden dtype` step only ever widens (backbone hidden states are either the autocast dtype itself or
+    float32), so it never rounds away bits that the following cast would have kept.
+
+    Args:
+        hidden_dtype (`torch.dtype`):
+            Dtype of the teacher's cached hidden targets.
+        device (`torch.device`):
+            Device the projection runs on; autocast is enabled per device type.
+
+    Returns:
+        `torch.dtype`: the autocast dtype when autocast is enabled for this device type, else `hidden_dtype`.
+    """
+    if torch.is_autocast_enabled(device.type):
+        return torch.get_autocast_dtype(device.type)
+    return hidden_dtype
+
+
 def _managed_chunk(h_s, w_s, b_s, s_scale, s_softcap, h_t_cpu, identity, head_cache, beta, temperature, valid):
     # Same body as the legacy `_chunk`, except the teacher arrives as a CPU slice plus an identity: the device head is
     # leased here so neither the checkpoint's arguments nor its graph retain it, and eviction between forward and
@@ -47,9 +72,12 @@ def _managed_chunk(h_s, w_s, b_s, s_scale, s_softcap, h_t_cpu, identity, head_ca
     # The teacher is a fixed target: `no_grad` (never inference mode, whose tensors cannot be saved by the student
     # loss) so the projection builds no autograd graph and the teacher head accumulates no gradients.
     with torch.no_grad():
-        with head_cache.projection_lease(identity, h_t_cpu.dtype) as head:
-            h_t = h_t_cpu.to(head.weight.device)
-            teacher_logits = (h_t @ head.weight.to(h_t.dtype).t()).float()
+        device = head_cache.device
+        # The lease materializes the head in the dtype the matmul executes in, so the projection adds no cast of its
+        # own; every use of the leased tensors finishes inside the block, which invalidates them on exit.
+        with head_cache.projection_lease(identity, _execution_dtype(h_t_cpu.dtype, device)) as head:
+            h_t = h_t_cpu.to(device)
+            teacher_logits = (h_t @ head.weight.t()).float()
             if head.bias is not None:
                 # The bias is in the source dtype: adding it after the upcast keeps an fp32 bias exact under a bf16
                 # execution dtype, matching the legacy `b.float()`.

@@ -84,11 +84,13 @@ class HeadCacheStats:
 class LeasedHead:
     """Device head tensors valid for the duration of one [`TeacherHeadCache.projection_lease`] block.
 
-    `bias` stays in the source dtype: the loss adds `bias.float()` after upcasting the projection, so rounding it
-    through the execution dtype would change the arithmetic.
+    `weight` is materialized in the requested execution dtype, so the projection needs no further cast. `bias` stays
+    in the source dtype: the loss adds `bias.float()` after upcasting the projection, so rounding it through the
+    execution dtype would change the arithmetic. Both fields are set to `None` when the lease exits, so the bundle a
+    `with ... as head` binding keeps alive past its block owns nothing and cannot pin an evicted head.
     """
 
-    weight: torch.Tensor
+    weight: torch.Tensor | None
     bias: torch.Tensor | None
 
 
@@ -98,11 +100,18 @@ class _ProjectionLease:
     def __init__(self, cache: "TeacherHeadCache", key: tuple):
         self._cache = cache
         self._key = key
+        self._head: LeasedHead | None = None
 
     def __enter__(self) -> LeasedHead:
-        return self._cache._acquire(self._key)
+        self._head = self._cache._acquire(self._key)
+        return self._head
 
     def __exit__(self, exc_type, exc_value, traceback) -> bool:
+        # Clear the bundle before the slot becomes available again: a `with ... as head` binding outlives the block,
+        # and a bundle that still owned the tensors would keep the evicted head alive. Callers must likewise not
+        # extract the tensors into longer-lived names.
+        self._head.weight = self._head.bias = None
+        self._head = None
         self._cache._release()
         # Falsy: checkpoint early-stop and application exceptions must propagate out of the chunk body.
         return False
@@ -179,11 +188,14 @@ class TeacherHeadCache:
             identity ([`HeadIdentity`]):
                 Teacher head to project through; its source must be retained.
             execution_dtype (`torch.dtype`):
-                Dtype the weight is materialized in, i.e. the dtype the projection matmul executes in. Part of the
-                cache key, so alternating dtypes count as misses.
+                Dtype the weight is materialized in: the *effective* dtype the projection matmul executes in, which
+                under autocast is the autocast dtype rather than the hidden states' own dtype. Materializing the head
+                in it keeps exactly one head resident, since the matmul then needs no implicit conversion. Part of
+                the cache key, so alternating dtypes count as misses.
 
         Returns:
-            `ContextManager[`[`LeasedHead`]`]`: yields the device tensors; the block must not store them.
+            `ContextManager[`[`LeasedHead`]`]`: yields the device tensors, which are invalidated on exit; the block
+            must finish every use of them before it ends and must not store them elsewhere.
         """
         return _ProjectionLease(self, (identity, self.device, execution_dtype))
 
