@@ -95,6 +95,102 @@ While training and evaluating, we record the following metrics:
 - `tools/failure_frequency`: The fraction of tool calls that failed (the tool was not found, raised an exception, or the call type is unsupported). It is `0.0` when no tool was called. Logged only when `tools` are provided.
 - `entropy`: Average entropy of token predictions across generated completions (in nats).
 
+## Multiple teachers (MOPD)
+
+> [!WARNING]
+> Managed multi-teacher execution is under active development. Nothing described in this section should be read as
+> validated for production training; treat it as an in-progress API surface, not a supported feature.
+
+Pass `teacher_models` instead of `teacher_model`/`teacher_model_name_or_path` to route different rows of the
+dataset to different teachers, e.g. one expert per domain fused into a single student. `teacher_models` is a mapping
+from a stable routing ID to a model path, Hub ID, or an already-loaded CPU model:
+
+```python
+trainer = DistillationTrainer(
+    model=student,
+    teacher_models={
+        "math": "org/math-expert",
+        "code": "org/code-expert",
+    },
+    processing_class=shared_tokenizer,
+    train_dataset=dataset,  # Rows contain "prompt" and "teacher_id".
+    args=DistillationConfig(
+        output_dir="mopd-student",
+        beta=1.0,  # Reverse KL, matching the on-policy distillation default.
+    ),
+)
+```
+
+`teacher_models` is mutually exclusive with `teacher_model` and `teacher_model_name_or_path`. Every training and
+evaluation row needs a `teacher_id` column naming one of the mapping's keys; the single-teacher trainer keeps its
+current behavior, where an absent `teacher_id` column selects that one teacher.
+
+Teacher IDs are routing names, not repository names: two IDs can point at different revisions of the same
+repository. `teacher_model_init_kwargs_by_teacher` sets per-ID loading overrides, applied after the common
+`teacher_model_init_kwargs`, most commonly a `revision`:
+
+```python
+args = DistillationConfig(
+    output_dir="mopd-student",
+    teacher_model_init_kwargs_by_teacher={
+        "early": {"revision": "<commit-A>"},
+        "late": {"revision": "<commit-B>"},
+    },
+)
+```
+
+Every teacher must share the student's tokenizer: same vocabulary, same special-token roles/IDs, same tokenization
+configuration. Rendering prompts once with the student's tokenizer and scoring the resulting token IDs directly is
+a v1 requirement, not a convenience default; teachers with a genuinely different tokenizer need alignment work this
+trainer does not yet do. Teacher hidden widths may still differ, since each teacher keeps its own output head.
+
+Memory is bounded by a small set of config fields, all optional:
+
+| Field | Meaning | Default |
+| --- | --- | --- |
+| `teacher_target_cache_bytes` | Per-rank byte budget for the CPU-resident window of teacher hidden targets | 1 GiB |
+| `teacher_scoring_batch_size` | Maximum rows scored in one teacher forward pass | 1 |
+| `teacher_cpu_weight_budget_bytes` | Cap on CPU-resident teacher weights and retained head sources | No explicit cap |
+| `teacher_gpu_weight_budget_bytes` | Cap on managed GPU-resident teacher weights | No explicit cap |
+
+Regardless of these caps, only one teacher body is kept loaded on CPU and only one teacher head lives on GPU at a
+time; explicit caps must be positive, and a microbatch or teacher that cannot fit within them fails loudly with the
+required bytes rather than silently degrading.
+
+With multiple teachers, per-teacher metrics are logged instead of (or alongside) the aggregate metrics above, with
+IDs percent-encoded into the key so an ID containing `/` cannot collide with another ID:
+
+- `teacher_jsd/{id}`: Mean beta-dependent divergence for that teacher's valid tokens, at the loss temperature.
+- `teacher_entropy/{id}`: Mean teacher entropy for that teacher's valid tokens, at the loss temperature.
+- `teacher_token_frac/{id}`: That teacher's valid tokens as a fraction of all valid tokens in the accumulated window.
+
+A teacher absent from the accumulated window still gets `teacher_token_frac/{id} = 0.0`, but its `teacher_jsd`/
+`teacher_entropy` are omitted rather than reported as a misleading zero loss.
+
+On save, teacher identities and numerical conventions (routing IDs/order, resolved revisions, tokenizer
+fingerprints, head identity, dtypes, beta, temperature, chunk size) are written to `teacher_manifest.json` next to
+the student checkpoint, excluding any loading credentials. On resume, the current run's manifest is compared
+against the saved one field-by-field, and a mismatch raises rather than silently retraining against a different
+teacher set.
+
+### Backend compatibility
+
+Managed multi-teacher execution separates **student training** from **teacher execution**: a sharded student never
+implies sharded teachers, and teachers stay plain, unsharded Transformers inference models. The table below
+describes compatibility with this managed lifecycle specifically, not general Transformers or single-teacher
+`DistillationTrainer` capability:
+
+| Mode | Status |
+| --- | --- |
+| Single GPU/DDP | First validation target |
+| ZeRO-1/2 (student) | Validation in progress, not yet supported |
+| FSDP2 (student) | Validation in progress, not yet supported |
+| FSDP1, ZeRO-3, tensor/pipeline/context parallelism, sharded teachers | Not supported |
+| Quantized teachers | Not supported |
+
+A mode not listed as supported should be assumed unsupported even if it happens to run without an explicit error;
+only stages with landed evidence get promoted in this table.
+
 ## Customization
 
 ### Speed up training with vLLM-powered generation
