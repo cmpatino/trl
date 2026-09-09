@@ -1122,6 +1122,22 @@ class TeacherExecutor:
             )
         return ScoreResult(request.teacher_index, offset, entry.hidden_dtype, forward_calls)
 
+    def align_target_dtypes(self) -> None:
+        """
+        Store targets in the dtype the backbones really return, probing every teacher that has not been observed.
+
+        Target blocks are planned and written in `target_dtype`, which defaults to the autocast dtype. When a backbone
+        returns something wider than that — CPU autocast keeps the final RMS norm in float32, for instance — storing
+        targets in the autocast dtype rounds the teacher's own output and changes the objective relative to the
+        single-teacher path, which keeps the teacher hidden states exactly as its forward produced them. Call this
+        once before the first [`~WindowStore.plan_window`] so storage is lossless; it costs one two-token forward per
+        teacher (and one body load, through the same single slot as scoring).
+        """
+        for entry in self.registry.entries:
+            if entry.hidden_dtype is None:
+                self.probe_hidden_dtype(entry.index)
+            entry.target_dtype = entry.hidden_dtype
+
     def probe_hidden_dtype(self, index: int) -> torch.dtype:
         """
         Observe teacher `index`'s backbone output dtype with a two-token forward under the recorded autocast policy.
@@ -1582,6 +1598,11 @@ class WindowStore:
                 self._key_blocks[key].append(block.block_id)
                 self._key_teachers[key].append(teacher_index)
                 self._block_refs[block.block_id] += 1
+
+    @property
+    def live_keys(self) -> list[tuple[int, int]]:
+        """Keys whose targets are scored and not yet released, so the trainer can refuse to close teachers."""
+        return sorted(self._targets)
 
     def targets_for(self, key: tuple[int, int], microbatch: dict | None = None) -> list[TargetGroup]:
         """
