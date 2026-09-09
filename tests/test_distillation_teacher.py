@@ -167,7 +167,7 @@ def score_single(executor, registry, microbatch, teacher_index=0, hidden_size=HI
     positions = (loss_mask.reshape(-1) > 0).nonzero().flatten()
     entry = registry.entries[teacher_index]
     block = HiddenTargetBlock(
-        1, torch.zeros((positions.numel(), hidden_size), dtype=entry.hidden_dtype), [None] * positions.numel()
+        1, torch.zeros((positions.numel(), hidden_size), dtype=entry.target_dtype), [None] * positions.numel()
     )
     request = ScoreRequest(
         generation_id=0,
@@ -296,8 +296,12 @@ class TestTeacherRegistry:
             "vocab_size",
             "source_dtype",
             "hidden_dtype",
+            "hidden_dtype_observed",
+            "target_dtype",
             "projection_dtype",
             "adapter_version",
+            "content_digest",
+            "content_hashed_bytes",
             "head",
             "evictable",
             "storage_bytes",
@@ -306,6 +310,10 @@ class TestTeacherRegistry:
         assert set(teacher) == expected
         # `TeacherManifest.from_registry` serializes these itself, so they stay native here.
         assert teacher["source_dtype"] == torch.float32
+        # No forward has run, so the reported hidden dtype is still the planned target dtype, flagged as such.
+        assert teacher["hidden_dtype_observed"] is False
+        assert teacher["hidden_dtype"] == teacher["target_dtype"] == torch.float32
+        assert teacher["content_hashed_bytes"] > 0
         assert teacher["head"] == {
             "weight_shape": (VOCAB_SIZE, HIDDEN_SIZE),
             "has_bias": False,
@@ -438,9 +446,29 @@ class TestTeacherExecutor:
     def test_capabilities_and_precision_records(self, sources, tokenizer):
         registry = make_registry({"early": sources["a"]}, tokenizer)
         executor = make_executor(registry)
+        entry = registry["early"]
         assert executor.capabilities == {"hidden_targets": True, "requires_collective_schedule": False}
-        assert registry["early"].hidden_dtype == torch.float32
-        assert registry["early"].projection_dtype == torch.float32
+        assert (entry.source_dtype, entry.target_dtype, entry.projection_dtype) == (
+            torch.float32,
+            torch.float32,
+            torch.float32,
+        )
+        # The backbone output dtype is measured, never taken from the configuration.
+        assert entry.hidden_dtype is None
+        assert executor.probe_hidden_dtype(0) == torch.float32
+        assert entry.hidden_dtype == torch.float32
+
+    def test_hidden_dtype_is_observed_at_first_scoring(self, sources, tokenizer):
+        registry = make_registry({"early": sources["a"]}, tokenizer)
+        executor = make_executor(registry)
+        entry = registry["early"]
+        assert entry.hidden_dtype is None
+        _, _, result = score_single(executor, registry, make_microbatch([0]))
+        assert entry.hidden_dtype == torch.float32
+        assert result.hidden_dtype == torch.float32
+        manifest = registry.manifest()["teachers"][0]
+        assert manifest["hidden_dtype_observed"] is True
+        assert manifest["hidden_dtype"] == torch.float32
 
     def test_evict_idle_gpu_delegates_to_the_head_cache(self, sources, tokenizer):
         registry = make_registry({"early": sources["a"]}, tokenizer)
@@ -493,11 +521,14 @@ class TestTeacherExecutor:
         registry = make_registry({"early": sources["a"]}, tokenizer)
         executor = make_executor(registry, autocast_dtype=torch.bfloat16)
         entry = registry["early"]
-        assert entry.hidden_dtype == torch.bfloat16 and entry.projection_dtype == torch.bfloat16
+        assert entry.target_dtype == torch.bfloat16 and entry.projection_dtype == torch.bfloat16
         assert entry.source_dtype == torch.float32  # the CPU source keeps its own dtype
         microbatch = make_microbatch([0])
         block, positions, result = score_single(executor, registry, microbatch)
-        assert block.hidden.dtype == torch.bfloat16 and result.hidden_dtype == torch.bfloat16
+        # Targets are stored in the target dtype; the observed backbone output dtype is recorded separately.
+        assert block.hidden.dtype == torch.bfloat16
+        assert result.hidden_dtype == entry.hidden_dtype
+        assert entry.hidden_dtype is not None
         model = AutoModelForCausalLM.from_pretrained(sources["a"], dtype=torch.float32)
         model.eval()
         input_ids = torch.cat([microbatch["prompt_ids"], microbatch["completion_ids"]], dim=1)
