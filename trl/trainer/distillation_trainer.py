@@ -1937,8 +1937,10 @@ class DistillationTrainer(_BaseTrainer):
             "num_items_in_batch": num_items_in_batch,
         }
         if self._managed:
-            # An int64 `(B,)` tensor, so the shuffle and the accumulation split permute/slice it with the tokens.
-            output["teacher_index"] = torch.tensor(teacher_index, dtype=torch.int64)
+            # An int64 `(B,)` tensor, so the shuffle and the accumulation split permute/slice it with the tokens, and
+            # on `device` like every other payload tensor: the window planner combines it with `completion_mask`, and
+            # a host routing column next to a device mask raises on an accelerator (it silently works on CPU).
+            output["teacher_index"] = torch.tensor(teacher_index, dtype=torch.int64, device=device)
         if "pixel_values" in forward_kwargs:
             output["pixel_values"] = forward_kwargs["pixel_values"]
         if "image_grid_thw" in forward_kwargs:

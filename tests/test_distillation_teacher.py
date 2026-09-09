@@ -518,7 +518,10 @@ class TestTeacherExecutor:
         assert result.hidden_dtype == torch.float32
         assert torch.equal(block.hidden, reference_hidden[positions])
         head = executor.retain_head_source(0)
-        assert torch.equal(block.hidden @ head.weight.t(), reference_logits[positions])
+        # The retained head reproduces the model's own logits, but not bitwise: this is `matmul` against the model's
+        # `lm_head` (an `F.linear`/`addmm`), and which kernel and reduction blocking each picks depends on the host
+        # BLAS and thread count. Observed on the GPU job's container, where the two paths differ in the last bits.
+        torch.testing.assert_close(block.hidden @ head.weight.t(), reference_logits[positions], rtol=1e-5, atol=1e-6)
 
     def test_tool_masked_position_is_excluded_but_stays_in_context(self, sources, tokenizer):
         registry = make_registry({"early": sources["a"]}, tokenizer)
@@ -631,7 +634,11 @@ class TestTeacherExecutor:
         microbatch = make_microbatch([0])
         reference_hidden, reference_logits = reference_forward(sources["a"], microbatch)
         positions = torch.arange(reference_hidden.shape[0])
-        assert torch.equal(reference_hidden @ head.weight.t(), reference_logits[positions])
+        # Same reason as in `test_hidden_and_logit_parity_with_a_plain_forward`: `matmul` here against the
+        # model's own `lm_head` there, so equality holds to a tight tolerance rather than bitwise.
+        torch.testing.assert_close(
+            reference_hidden @ head.weight.t(), reference_logits[positions], rtol=1e-5, atol=1e-6
+        )
         assert executor.stats.body_loads == 2 and executor.stats.cpu_reloads == 0
         executor._load_body(0)
         assert executor.stats.cpu_reloads == 1

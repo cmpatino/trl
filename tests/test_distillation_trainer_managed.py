@@ -24,7 +24,12 @@ from datasets import Dataset, load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 
 from trl import DistillationConfig, DistillationTrainer
-from trl.trainer._distillation_teacher import _TARGET_BLOCK_OVERHEAD_BYTES, WindowStore
+from trl.trainer._distillation_teacher import (
+    _TARGET_BLOCK_OVERHEAD_BYTES,
+    WindowStore,
+    _as_cpu,
+    _microbatch_fingerprint,
+)
 
 from .testing_utils import TrlTestCase
 
@@ -399,6 +404,82 @@ class TestManagedMasks(TrlTestCase):
         }
         with pytest.raises(ValueError, match="no rows"):
             store.plan_window([empty], target_cache_bytes=1 << 20)
+
+
+class TestManagedDeviceBoundaries(TrlTestCase):
+    """
+    The generation payload lives on the accelerator; the window store's bookkeeping is host-side by contract.
+
+    A device payload tensor combined with a host one silently works on CPU and raises `RuntimeError: Expected all
+    tensors to be on the same device` on an accelerator, which is how the first GPU run of `mopd_parity.py --mode
+    ddp` failed inside `WindowStore._microbatch_groups`. These tests pin the two halves of the contract that *are*
+    observable without an accelerator: every payload tensor shares one device, and everything the store hands back is
+    on the host. The cross-device behaviour itself can only be covered by the GPU job (gate AB/DDP in
+    `implementation/gpu/run_gate.sh`).
+    """
+
+    def test_managed_bookkeeping_stays_on_the_host(self, teachers):
+        training_args = DistillationConfig(
+            output_dir=self.tmp_dir,
+            per_device_train_batch_size=2,
+            max_completion_length=4,
+            max_steps=1,
+            report_to="none",
+        )
+        trainer = DistillationTrainer(
+            model=MODEL_ID,
+            args=training_args,
+            train_dataset=_routed_dataset(["a", "b"] * 4),
+            teacher_models=teachers,
+        )
+        trainer.model.train()
+        batch = next(iter(trainer.get_train_dataloader()))
+        inputs = trainer._prepare_inputs(batch)
+
+        # Every routing/payload tensor sits on the accelerator device, next to the tokens and the masks: a host
+        # `teacher_index` beside a device `completion_mask` is exactly what broke on GPU.
+        payload_device = inputs["completion_mask"].device
+        assert payload_device == trainer.accelerator.device
+        for key in ("prompt_ids", "prompt_mask", "completion_ids", "completion_mask", "teacher_index"):
+            assert inputs[key].device == payload_device, f"{key} is on {inputs[key].device}, not {payload_device}"
+        assert inputs["teacher_index"].dtype == torch.int64
+        assert inputs["teacher_index"].shape == (inputs["completion_ids"].shape[0],)
+
+        # Everything the store produced is host-side: the loss moves the positions and the target rows itself.
+        groups = trainer._teacher_store.targets_for(inputs["_teacher_targets_key"], inputs)
+        assert groups, "no target groups were scored"
+        for group in groups:
+            assert group.positions.device.type == "cpu"
+            assert group.positions.dtype == torch.int64
+            assert group.hidden.device.type == "cpu"
+        # And the fingerprint the store compares is plain Python values, not device tensors.
+        fingerprint = _microbatch_fingerprint(inputs)
+        assert all(isinstance(value, (int, tuple)) for value in fingerprint)
+        assert all(isinstance(index, int) for index in fingerprint[3])
+
+        trainer._teacher_store.release(inputs["_teacher_targets_key"])
+        trainer.close_teachers()
+
+    def test_as_cpu_converts_only_non_host_tensors(self):
+        host = torch.zeros(3, dtype=torch.int64)
+        assert _as_cpu(host) is host, "an already-host tensor must not be copied"
+
+        class _OffHost:
+            """Minimal stand-in for a device tensor: `_as_cpu` reads `.device.type` and calls `.cpu()`."""
+
+            def __init__(self, replacement):
+                self.device = torch.device("cuda", 0)
+                self.replacement = replacement
+                self.calls = 0
+
+            def cpu(self):
+                self.calls += 1
+                return self.replacement
+
+        replacement = torch.ones(2, dtype=torch.int64)
+        off_host = _OffHost(replacement)
+        assert _as_cpu(off_host) is replacement
+        assert off_host.calls == 1
 
 
 class TestManagedEvaluation(TrlTestCase):
