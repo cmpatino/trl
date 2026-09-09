@@ -1682,31 +1682,36 @@ class WindowStore:
                 "new one"
             )
         blocks = {}
-        for block_key, rows in plan.block_rows.items():
-            width, dtype = block_key
-            self._next_block_id += 1
-            block = HiddenTargetBlock(self._next_block_id, torch.zeros((rows, width), dtype=dtype), [None] * rows)
-            blocks[block_key] = block
-            self._blocks[block.block_id] = block
-            self._block_refs[block.block_id] = 0
-        block_ids = [block.block_id for block in blocks.values()]
-        offsets = dict.fromkeys(plan.block_rows, 0)
-        ranges = []
-        for group in plan.groups:
-            start = offsets[group.block_key]
-            offsets[group.block_key] = start + group.positions.numel()
-            ranges.append((start, offsets[group.block_key]))
-        for key in keys:
-            self._targets[key] = []
-            self._key_blocks[key] = []
-            self._key_teachers[key] = []
-            self._consumers[key] = 1
-            self._fingerprints[key] = _microbatch_fingerprint(inputs[key[1]], key[0], key[1])
-            self._released.discard(key)
+        block_ids = []
         try:
+            for block_key, rows in plan.block_rows.items():
+                width, dtype = block_key
+                self._next_block_id += 1
+                block = HiddenTargetBlock(self._next_block_id, torch.zeros((rows, width), dtype=dtype), [None] * rows)
+                blocks[block_key] = block
+                self._blocks[block.block_id] = block
+                self._block_refs[block.block_id] = 0
+                block_ids.append(block.block_id)
+            offsets = dict.fromkeys(plan.block_rows, 0)
+            ranges = []
+            for group in plan.groups:
+                start = offsets[group.block_key]
+                offsets[group.block_key] = start + group.positions.numel()
+                ranges.append((start, offsets[group.block_key]))
+            for key in keys:
+                # Fingerprint first: it copies and hashes the payload on the host, so it is the step that can fail
+                # here, and a key must never be published as a consumer without the fingerprint its release expects.
+                fingerprint = _microbatch_fingerprint(inputs[key[1]], key[0], key[1])
+                self._targets[key] = []
+                self._key_blocks[key] = []
+                self._key_teachers[key] = []
+                self._fingerprints[key] = fingerprint
+                self._consumers[key] = 1
+                self._released.discard(key)
             self._score_groups(plan, executor, inputs, blocks, ranges)
         except BaseException:
-            # Ownership is registered as it is acquired, so the rollback releases exactly what this window took.
+            # Preparation and scoring share one rollback: blocks are tracked from creation and ownership is
+            # registered as it is acquired, so this releases exactly what the window took, however far it got.
             self._rollback_window(keys, block_ids)
             raise
 
@@ -1758,14 +1763,18 @@ class WindowStore:
                     )
 
     def _rollback_window(self, keys: list[tuple[int, int]], block_ids: list[int]) -> None:
-        """Undo a partially built window: release its head retentions and drop its blocks, leaving no key alive."""
+        """
+        Undo a partially built window, leaving no key or block alive.
+
+        Runs while another exception is propagating, so it must not raise over it: every key of the window is freed,
+        published or not, and every block created for it is dropped once nothing references it.
+        """
         for key in keys:
-            if key in self._consumers:
-                self._free_key(key)
+            self._free_key(key)
         for block_id in block_ids:
             if self._block_refs.get(block_id) == 0:
-                self._blocks.pop(block_id)
-                self._block_refs.pop(block_id)
+                self._blocks.pop(block_id, None)
+                self._block_refs.pop(block_id, None)
 
     @property
     def live_keys(self) -> list[tuple[int, int]]:
@@ -1807,24 +1816,36 @@ class WindowStore:
         self._released.add(key)
 
     def reset(self) -> None:
-        """Drop every window: used when the generation buffer is renewed or training resumes from a checkpoint."""
-        for key in list(self._consumers):
+        """
+        Drop every window: used when the generation buffer is renewed or training resumes from a checkpoint.
+
+        Also runs from the trainer's cleanup scope while a failure propagates, so it covers partially published keys
+        and never raises over the original exception.
+        """
+        for key in sorted(set(self._consumers) | set(self._targets) | set(self._fingerprints)):
             self._free_key(key)
         self._released.clear()
         self._blocks.clear()
         self._block_refs.clear()
+        self._targets.clear()
+        self._key_blocks.clear()
+        self._key_teachers.clear()
+        self._consumers.clear()
+        self._fingerprints.clear()
 
     def _free_key(self, key: tuple[int, int]) -> None:
-        for teacher_index in self._key_teachers.pop(key):
+        """Release everything one key owns. Tolerates a key that was only partially published by a failed window."""
+        for teacher_index in self._key_teachers.pop(key, []):
             self._executor.release_head_source(teacher_index)
-        for block_id in self._key_blocks.pop(key):
-            self._block_refs[block_id] -= 1
-            if self._block_refs[block_id] == 0:
-                self._blocks.pop(block_id)
-                self._block_refs.pop(block_id)
-        self._targets.pop(key)
-        self._consumers.pop(key)
-        self._fingerprints.pop(key)
+        for block_id in self._key_blocks.pop(key, []):
+            if block_id in self._block_refs:
+                self._block_refs[block_id] -= 1
+                if self._block_refs[block_id] == 0:
+                    self._blocks.pop(block_id, None)
+                    self._block_refs.pop(block_id)
+        self._targets.pop(key, None)
+        self._consumers.pop(key, None)
+        self._fingerprints.pop(key, None)
 
     def _microbatch_groups(self, microbatch: dict, index: int) -> list[_PlannedGroup]:
         # Planning is host bookkeeping: the mask and the routing column are brought to the host once, up front, so the

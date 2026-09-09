@@ -919,6 +919,39 @@ class TestManagedFailureCleanup(TrlTestCase):
         assert trainer._teacher_head_cache.stats.live_head_bytes == 0
         trainer.close_teachers()
 
+    def test_a_window_preparation_failure_propagates_its_own_error(self, teachers):
+        """The trainer's cleanup scope calls `reset()`; a partially prepared window must not turn it into a KeyError."""
+
+        def failing_fingerprint(microbatch, generation_id, microbatch_index):
+            raise MemoryError("host copy failed")
+
+        training_args = DistillationConfig(
+            output_dir=self.tmp_dir,
+            per_device_train_batch_size=2,
+            gradient_accumulation_steps=2,
+            max_completion_length=4,
+            max_steps=1,
+            report_to="none",
+        )
+        trainer = DistillationTrainer(
+            model=MODEL_ID,
+            args=training_args,
+            train_dataset=_routed_dataset(["a", "b"] * 8),
+            teacher_models=teachers,
+        )
+        with patch("trl.trainer._distillation_teacher._microbatch_fingerprint", failing_fingerprint):
+            with pytest.raises(MemoryError):
+                trainer.train()
+
+        assert trainer._teacher_store.live_keys == []
+        assert trainer._teacher_executor._head_refcounts == {}
+        assert trainer._teacher_head_cache.stats.live_head_bytes == 0
+        assert (trainer.state.global_step, trainer._step) == (0, 0)
+        trainer.close_teachers()
+        # The patch is scoped to the failing run, so a normal window still prepares, scores and steps.
+        trainer.train()
+        assert trainer.state.global_step == 1
+
     def test_compute_loss_without_prepared_targets_raises(self, teachers):
         training_args = DistillationConfig(
             output_dir=self.tmp_dir, per_device_train_batch_size=2, max_completion_length=4, report_to="none"
