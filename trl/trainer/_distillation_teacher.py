@@ -990,6 +990,16 @@ class ScoreResult:
 
 
 @dataclass
+class _ScoringLease:
+    """One teacher's disposable device backbone, held across every scoring request of a window."""
+
+    teacher_index: int
+    backbone: object
+    device_state: dict
+    device_bytes: int
+
+
+@dataclass
 class ExecutorStats:
     """
     Performance counters of the scoring executor; the `device` counters cover the disposable scoring copies.
@@ -1086,6 +1096,7 @@ class TeacherExecutor:
         self._head_sources: dict[int, HeadSource] = {}
         self._head_refcounts: dict[int, int] = {}
         self._staging: torch.Tensor | None = None
+        self._lease: _ScoringLease | None = None
         self._closed = False
         self._non_evictable_bytes = sum(entry.storage_bytes for entry in registry.entries if not entry.evictable)
         self._account_cpu()
@@ -1157,47 +1168,86 @@ class TeacherExecutor:
                 f"scoring request has {request.input_ids.shape[1]} tokens but prompt_length={prompt_length} and "
                 f"completion_length={completion_length}"
             )
-        body = self._load_body(request.teacher_index)
-        backbone = _teacher_backbone(body)
+        if self._lease is not None:
+            if self._lease.teacher_index != request.teacher_index:
+                raise RuntimeError(
+                    f"a scoring lease for teacher index {self._lease.teacher_index} is active, so teacher index "
+                    f"{request.teacher_index} cannot be scored: one teacher occupies the device at a time"
+                )
+            return self._score_leased(self._lease, request, writer, entry, positions)
+        with self.scoring_lease(request.teacher_index) as lease:
+            return self._score_leased(lease, request, writer, entry, positions)
+
+    @contextlib.contextmanager
+    def scoring_lease(self, index: int):
+        """
+        Hold teacher `index`'s device backbone for the duration of the block, so a window uploads it once.
+
+        Every [`~TeacherExecutor.score`] call inside the block reuses the substituted device parameters and buffers
+        instead of rebuilding them, which is what amortizes the upload over the microbatches of a scoring window;
+        forward subbatches stay bounded by `scoring_batch_size`. The backbone is released on exit, including when the
+        block raises, so no teacher weights are resident while the student trains.
+
+        Args:
+            index (`int`):
+                Registry index of the teacher to score with.
+
+        Returns:
+            `ContextManager[_ScoringLease]`: the active lease.
+        """
+        self._check_open()
+        if self._lease is not None:
+            raise RuntimeError(
+                f"a scoring lease for teacher index {self._lease.teacher_index} is already active; one teacher "
+                "occupies the device at a time"
+            )
+        backbone = _teacher_backbone(self._load_body(index))
         device_state, device_bytes = self._device_state(backbone)
-        forward_calls = 0
-        offset = 0
+        self._lease = _ScoringLease(index, backbone, device_state, device_bytes)
         try:
-            for start in range(0, request.input_ids.shape[0], self.scoring_batch_size):
-                stop = min(start + self.scoring_batch_size, request.input_ids.shape[0])
-                selected = positions[(positions >= start * completion_length) & (positions < stop * completion_length)]
-                if selected.numel() == 0:
-                    continue
-                input_ids = request.input_ids[start:stop].to(self.device)
-                attention_mask = request.attention_mask[start:stop].to(self.device)
-                with torch.no_grad(), self._autocast():
-                    output = torch.func.functional_call(
-                        backbone,
-                        device_state,
-                        args=(),
-                        kwargs={"input_ids": input_ids, "attention_mask": attention_mask, "use_cache": False},
-                        tie_weights=True,
-                        strict=True,
-                    )
-                hidden = output.last_hidden_state
-                self._record_hidden_dtype(entry, hidden.dtype)
-                if hidden.shape[1] != input_ids.shape[1]:
-                    raise RuntimeError(
-                        f"teacher '{entry.teacher_id}' returned {hidden.shape[1]} hidden states for "
-                        f"{input_ids.shape[1]} input tokens; the managed adapter requires full-length outputs before "
-                        "the causal shift"
-                    )
-                # Same alignment as `_get_last_hidden_state`: drop the next-token prediction, then keep the completion
-                # window, so row `k` is the state that predicts completion token `k`.
-                completion_hidden = hidden[:, :-1][:, prompt_length - 1 : prompt_length - 1 + completion_length]
-                rows = completion_hidden.reshape(-1, completion_hidden.shape[-1])
-                local = (selected - start * completion_length).to(self.device)
-                writer.write(offset, rows.index_select(0, local))
-                offset += selected.numel()
-                forward_calls += 1
+            yield self._lease
         finally:
+            self._lease = None
             device_state.clear()
             self.stats.live_device_weight_bytes -= device_bytes
+
+    def _score_leased(self, lease, request, writer, entry, positions) -> ScoreResult:
+        """Run one request's bounded subbatches through the leased device backbone."""
+        prompt_length, completion_length = request.prompt_length, request.completion_length
+        forward_calls = 0
+        offset = 0
+        for start in range(0, request.input_ids.shape[0], self.scoring_batch_size):
+            stop = min(start + self.scoring_batch_size, request.input_ids.shape[0])
+            selected = positions[(positions >= start * completion_length) & (positions < stop * completion_length)]
+            if selected.numel() == 0:
+                continue
+            input_ids = request.input_ids[start:stop].to(self.device)
+            attention_mask = request.attention_mask[start:stop].to(self.device)
+            with torch.no_grad(), self._autocast():
+                output = torch.func.functional_call(
+                    lease.backbone,
+                    lease.device_state,
+                    args=(),
+                    kwargs={"input_ids": input_ids, "attention_mask": attention_mask, "use_cache": False},
+                    tie_weights=True,
+                    strict=True,
+                )
+            hidden = output.last_hidden_state
+            self._record_hidden_dtype(entry, hidden.dtype)
+            if hidden.shape[1] != input_ids.shape[1]:
+                raise RuntimeError(
+                    f"teacher '{entry.teacher_id}' returned {hidden.shape[1]} hidden states for "
+                    f"{input_ids.shape[1]} input tokens; the managed adapter requires full-length outputs before "
+                    "the causal shift"
+                )
+            # Same alignment as `_get_last_hidden_state`: drop the next-token prediction, then keep the completion
+            # window, so row `k` is the state that predicts completion token `k`.
+            completion_hidden = hidden[:, :-1][:, prompt_length - 1 : prompt_length - 1 + completion_length]
+            rows = completion_hidden.reshape(-1, completion_hidden.shape[-1])
+            local = (selected - start * completion_length).to(self.device)
+            writer.write(offset, rows.index_select(0, local))
+            offset += selected.numel()
+            forward_calls += 1
         self.stats.forward_calls += forward_calls
         self.stats.rows_scored += offset
         if offset != positions.numel():
@@ -1299,6 +1349,11 @@ class TeacherExecutor:
 
     def close(self) -> None:
         """Release the body, the staging tile and every head source; rejects live target consumers. Idempotent."""
+        if self._lease is not None:
+            raise RuntimeError(
+                f"cannot close the teacher executor while a scoring lease for teacher index "
+                f"{self._lease.teacher_index} is active"
+            )
         if self._head_refcounts:
             raise RuntimeError(
                 f"cannot close the teacher executor while head sources are retained for teacher indices "
@@ -1601,7 +1656,12 @@ class WindowStore:
 
     def score_window(self, plan: WindowPlan, executor: TeacherExecutor, inputs: list[dict]) -> None:
         """
-        Fill the window's target blocks, loading one teacher at a time and releasing its device weights after its rows.
+        Fill the window's target blocks, holding one teacher at a time and releasing its device weights after its rows.
+
+        Each teacher's requests run inside one [`~TeacherExecutor.scoring_lease`], so its backbone is uploaded once
+        per window instead of once per microbatch. Cleanup ownership of a retained head or a filled block is recorded
+        the moment it is acquired, and a failure anywhere in the window rolls the partially built window back before
+        re-raising, so `reset()` and `close_teachers()` have nothing left to trip over.
 
         Args:
             plan ([`WindowPlan`]):
@@ -1629,6 +1689,7 @@ class WindowStore:
             blocks[block_key] = block
             self._blocks[block.block_id] = block
             self._block_refs[block.block_id] = 0
+        block_ids = [block.block_id for block in blocks.values()]
         offsets = dict.fromkeys(plan.block_rows, 0)
         ranges = []
         for group in plan.groups:
@@ -1640,48 +1701,71 @@ class WindowStore:
             self._key_blocks[key] = []
             self._key_teachers[key] = []
             self._consumers[key] = 1
-            self._fingerprints[key] = _microbatch_fingerprint(inputs[key[1]])
+            self._fingerprints[key] = _microbatch_fingerprint(inputs[key[1]], key[0], key[1])
             self._released.discard(key)
+        try:
+            self._score_groups(plan, executor, inputs, blocks, ranges)
+        except BaseException:
+            # Ownership is registered as it is acquired, so the rollback releases exactly what this window took.
+            self._rollback_window(keys, block_ids)
+            raise
+
+    def _score_groups(self, plan: WindowPlan, executor: TeacherExecutor, inputs, blocks, ranges) -> None:
+        """Score every planned group, one device lease per teacher, registering ownership as it is acquired."""
         for teacher_index in plan.teacher_indices:
             entry = self.registry.entries[teacher_index]
-            for group, (start, end) in zip(plan.groups, ranges, strict=True):
-                if group.teacher_index != teacher_index:
-                    continue
-                microbatch = inputs[group.microbatch_index]
-                block = blocks[group.block_key]
-                key = (plan.generation_id, group.microbatch_index)
-                executor.retain_head_source(teacher_index)
-                completion_length = microbatch["completion_ids"].shape[1]
-                sample_ids = _sample_ids(microbatch, plan.generation_id, group.microbatch_index)
-                request = ScoreRequest(
-                    generation_id=plan.generation_id,
-                    microbatch_index=group.microbatch_index,
-                    teacher_index=teacher_index,
-                    input_ids=torch.cat([microbatch["prompt_ids"], microbatch["completion_ids"]], dim=1),
-                    attention_mask=torch.cat([microbatch["prompt_mask"], microbatch["completion_mask"]], dim=1),
-                    prompt_length=microbatch["prompt_ids"].shape[1],
-                    completion_length=completion_length,
-                    positions=group.positions,
-                    sample_ids=sample_ids,
-                )
-                writer = executor.target_writer(block, torch.arange(start, end))
-                executor.score(request, writer)
-                for row, position in enumerate(group.positions.tolist()):
-                    block.row_samples[start + row] = (
-                        sample_ids[position // completion_length],
-                        position % completion_length,
-                    )
-                self._targets[key].append(
-                    TargetGroup(
-                        identity=entry.head_identity,
+            with executor.scoring_lease(teacher_index):
+                for group, (start, end) in zip(plan.groups, ranges, strict=True):
+                    if group.teacher_index != teacher_index:
+                        continue
+                    microbatch = inputs[group.microbatch_index]
+                    block = blocks[group.block_key]
+                    key = (plan.generation_id, group.microbatch_index)
+                    executor.retain_head_source(teacher_index)
+                    # Record the retention and the block reference before scoring: an exception below must leave a
+                    # window whose owned resources are all reachable from this bookkeeping.
+                    self._key_teachers[key].append(teacher_index)
+                    self._key_blocks[key].append(block.block_id)
+                    self._block_refs[block.block_id] += 1
+                    completion_length = microbatch["completion_ids"].shape[1]
+                    sample_ids = _sample_ids(microbatch, plan.generation_id, group.microbatch_index)
+                    request = ScoreRequest(
+                        generation_id=plan.generation_id,
+                        microbatch_index=group.microbatch_index,
                         teacher_index=teacher_index,
-                        hidden=block.hidden[start:end],
+                        input_ids=torch.cat([microbatch["prompt_ids"], microbatch["completion_ids"]], dim=1),
+                        attention_mask=torch.cat([microbatch["prompt_mask"], microbatch["completion_mask"]], dim=1),
+                        prompt_length=microbatch["prompt_ids"].shape[1],
+                        completion_length=completion_length,
                         positions=group.positions,
+                        sample_ids=sample_ids,
                     )
-                )
-                self._key_blocks[key].append(block.block_id)
-                self._key_teachers[key].append(teacher_index)
-                self._block_refs[block.block_id] += 1
+                    writer = executor.target_writer(block, torch.arange(start, end))
+                    executor.score(request, writer)
+                    for row, position in enumerate(group.positions.tolist()):
+                        block.row_samples[start + row] = (
+                            sample_ids[position // completion_length],
+                            position % completion_length,
+                        )
+                    # Only a fully scored group becomes visible to consumers.
+                    self._targets[key].append(
+                        TargetGroup(
+                            identity=entry.head_identity,
+                            teacher_index=teacher_index,
+                            hidden=block.hidden[start:end],
+                            positions=group.positions,
+                        )
+                    )
+
+    def _rollback_window(self, keys: list[tuple[int, int]], block_ids: list[int]) -> None:
+        """Undo a partially built window: release its head retentions and drop its blocks, leaving no key alive."""
+        for key in keys:
+            if key in self._consumers:
+                self._free_key(key)
+        for block_id in block_ids:
+            if self._block_refs.get(block_id) == 0:
+                self._blocks.pop(block_id)
+                self._block_refs.pop(block_id)
 
     @property
     def live_keys(self) -> list[tuple[int, int]]:
@@ -1706,7 +1790,7 @@ class WindowStore:
             raise RuntimeError(f"targets for {key} were already released; each microbatch consumes its targets once")
         if key not in self._targets:
             raise RuntimeError(f"no scored targets for {key}; live keys are {sorted(self._targets)}")
-        if microbatch is not None and _microbatch_fingerprint(microbatch) != self._fingerprints[key]:
+        if microbatch is not None and _microbatch_fingerprint(microbatch, key[0], key[1]) != self._fingerprints[key]:
             raise RuntimeError(
                 f"the microbatch presented for {key} does not match the tokens and masks its targets were scored for"
             )
@@ -1791,15 +1875,40 @@ def _loss_mask(microbatch: dict) -> torch.Tensor:
     return _as_cpu(mask)
 
 
-def _microbatch_fingerprint(microbatch: dict) -> tuple:
-    """Token/mask shapes and content summary validated before targets are consumed; plain Python values only."""
-    loss_mask = _loss_mask(microbatch)
-    return (
-        tuple(microbatch["prompt_ids"].shape),
-        tuple(microbatch["completion_ids"].shape),
-        int(loss_mask.sum()),
-        tuple(_as_cpu(microbatch["teacher_index"]).tolist()),
-    )
+# Payload tensors the targets depend on: the exact tokens scored, the attention context they were scored in, the
+# mask that selected the positions, and the per-row routing.
+_FINGERPRINTED_KEYS = ("prompt_ids", "prompt_mask", "completion_ids", "completion_mask", "tool_mask", "teacher_index")
+
+
+def _microbatch_fingerprint(microbatch: dict, generation_id: int, microbatch_index: int) -> str:
+    """
+    Digest of the payload the targets were scored from, checked before they are consumed.
+
+    Shapes and valid-token counts are not enough: one changed completion token, a mask position moved to another
+    token, or two rows swapped all keep them, and each makes the cached targets belong to a different batch. The
+    tensor values themselves are hashed on the host in bounded blocks, once at scoring time and once per consumption.
+
+    Args:
+        microbatch (`dict`):
+            Generation-payload microbatch. Keys other than the fingerprinted tokens, masks and routing are ignored,
+            so the trainer can carry its own bookkeeping alongside them.
+        generation_id (`int`):
+            Generation batch the microbatch belongs to.
+        microbatch_index (`int`):
+            Index of the microbatch inside that generation batch.
+
+    Returns:
+        `str`: hex sha256 digest.
+    """
+    digest = hashlib.sha256()
+    for name in _FINGERPRINTED_KEYS:
+        if name not in microbatch:
+            continue
+        tensor = _as_cpu(microbatch[name])
+        digest.update(f"{name}|{tensor.dtype}|{tuple(tensor.shape)}".encode())
+        _hash_tensor_blocks(digest, tensor)
+    digest.update(repr(_sample_ids(microbatch, generation_id, microbatch_index)).encode("utf-8"))
+    return digest.hexdigest()
 
 
 def _sample_ids(microbatch: dict, generation_id: int, microbatch_index: int) -> tuple:
