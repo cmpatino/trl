@@ -808,21 +808,17 @@ class DistillationTrainer(_BaseTrainer):
                 student_model=self.accelerator.unwrap_model(self.model),
                 trust_remote_code=args.trust_remote_code,
             )
-            # Every rank resolves its own revisions and reads its own checkpoint files, so a divergent mirror, a
-            # moved branch or a per-rank environment difference would silently train different ranks against
-            # different teachers. Compare the identity digest once, here, rather than per step.
-            digests = gather_object([self._teacher_registry.identity_digest()])
-            if len(set(digests)) > 1:
-                raise ValueError(
-                    f"The registered teachers differ across processes: `identity_digest()` returned "
-                    f"{sorted(set(digests))}. Every rank must resolve the same teacher IDs, revisions, dtypes and "
-                    "head identities; pin revisions explicitly in `args.teacher_model_init_kwargs_by_teacher`."
-                )
             # Scoring runs in `_prepare_inputs`, outside the student wrapper's precision context, so the intended
-            # autocast dtype is passed explicitly (design "Preserve the objective and numerical behavior").
-            scoring_autocast_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(
-                self.accelerator.mixed_precision
-            )
+            # autocast dtype has to be passed to the executor explicitly (design "Preserve the objective and
+            # numerical behavior"). Read it from the very context the student loss runs in rather than from
+            # `accelerator.mixed_precision`: the two disagree whenever Trainer declines to autocast (CPU training
+            # with `bf16=True`, for instance), and scoring in a precision the student loss never uses would make the
+            # teacher targets differ from what the single-teacher path computes.
+            device_type = self.accelerator.device.type
+            with self.compute_loss_context_manager():
+                scoring_autocast_dtype = (
+                    torch.get_autocast_dtype(device_type) if torch.is_autocast_enabled(device_type) else None
+                )
             self._teacher_head_cache = TeacherHeadCache(self.accelerator.device)
             self._teacher_executor = TeacherExecutor(
                 self._teacher_registry,
@@ -833,6 +829,21 @@ class DistillationTrainer(_BaseTrainer):
                 scoring_batch_size=args.teacher_scoring_batch_size,
                 autocast_dtype=scoring_autocast_dtype,
             )
+            # Measure every teacher's backbone output dtype now and store targets in it, so the targets are exactly
+            # what the teacher computed (the single-teacher path keeps them that way too) and so an unloadable
+            # teacher fails at construction rather than mid-accumulation. Also fixes the target dtype before the
+            # digest below, which covers it.
+            self._teacher_executor.align_target_dtypes()
+            # Every rank resolves its own revisions and reads its own checkpoint files, so a divergent mirror, a
+            # moved branch or a per-rank environment difference would silently train different ranks against
+            # different teachers. Compare the identity digest once, here, rather than per step.
+            digests = gather_object([self._teacher_registry.identity_digest()])
+            if len(set(digests)) > 1:
+                raise ValueError(
+                    f"The registered teachers differ across processes: `identity_digest()` returned "
+                    f"{sorted(set(digests))}. Every rank must resolve the same teacher IDs, revisions, dtypes and "
+                    "head identities; pin revisions explicitly in `args.teacher_model_init_kwargs_by_teacher`."
+                )
             self._teacher_store = WindowStore(self._teacher_registry)
             # Generation batches get increasing IDs; evaluation batches get decreasing negative ones, so training and
             # evaluation target keys can never collide even when an evaluation runs inside a training accumulation.
