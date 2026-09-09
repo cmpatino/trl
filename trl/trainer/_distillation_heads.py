@@ -180,7 +180,9 @@ class TeacherHeadCache:
                 self._free_slot()
             self._sources.pop(identity, None)
 
-    def projection_lease(self, identity: HeadIdentity, execution_dtype: torch.dtype) -> _ProjectionLease:
+    def projection_lease(
+        self, identity: HeadIdentity, execution_dtype: torch.dtype, operand_dtype: torch.dtype | None = None
+    ) -> _ProjectionLease:
         """
         Lease the device head for one projection.
 
@@ -190,14 +192,21 @@ class TeacherHeadCache:
             execution_dtype (`torch.dtype`):
                 Dtype the weight is materialized in: the *effective* dtype the projection matmul executes in, which
                 under autocast is the autocast dtype rather than the hidden states' own dtype. Materializing the head
-                in it keeps exactly one head resident, since the matmul then needs no implicit conversion. Part of
-                the cache key, so alternating dtypes count as misses.
+                in it keeps exactly one head resident, since the matmul then needs no implicit conversion.
+            operand_dtype (`torch.dtype`, *optional*):
+                Dtype the baseline matches the head to before the matmul, i.e. the hidden states' dtype. When it
+                differs from `execution_dtype` the two casts are applied in that order, tile by tile in the staging
+                buffer, so the rounding sequence is the baseline's. Defaults to `execution_dtype`, meaning a single
+                cast.
 
         Returns:
             `ContextManager[`[`LeasedHead`]`]`: yields the device tensors, which are invalidated on exit; the block
             must finish every use of them before it ends and must not store them elsewhere.
         """
-        return _ProjectionLease(self, (identity, self.device, execution_dtype))
+        operand_dtype = execution_dtype if operand_dtype is None else operand_dtype
+        # Both dtypes are part of the cache key: the head's values depend on the whole rounding sequence, so a
+        # different operand dtype is a different head, not a reusable one.
+        return _ProjectionLease(self, (identity, self.device, operand_dtype, execution_dtype))
 
     def evict_idle_gpu(self) -> None:
         """Free the device slot when no lease is active, after outstanding device work completes."""
@@ -247,12 +256,13 @@ class TeacherHeadCache:
         self._key = self._weight = self._bias = None
 
     def _upload(self, key: tuple) -> None:
-        identity, _, execution_dtype = key
+        identity, _, operand_dtype, execution_dtype = key
         source = self._sources[identity]
         start = time.perf_counter()
-        weight = self._staged_copy(source.weight, execution_dtype)
+        # Detached: a caller-owned teacher's head may still carry `requires_grad`, and no gradient may ever reach it.
+        weight = self._staged_copy(source.weight.detach(), operand_dtype, execution_dtype)
         # The bias keeps its source dtype and is vocabulary-sized, so it goes straight over without a staging tile.
-        bias = None if source.bias is None else source.bias.to(device=self.device, copy=True)
+        bias = None if source.bias is None else source.bias.detach().to(device=self.device, copy=True)
         self.stats.upload_seconds += time.perf_counter() - start
         self.stats.uploads += 1
         self.stats.bytes_uploaded += _head_bytes(weight, bias)
@@ -260,14 +270,18 @@ class TeacherHeadCache:
         self.stats.peak_head_bytes = max(self.stats.peak_head_bytes, self.stats.live_head_bytes)
         self._key, self._weight, self._bias = key, weight, bias
 
-    def _staged_copy(self, source: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    def _staged_copy(
+        self, source: torch.Tensor, operand_dtype: torch.dtype, execution_dtype: torch.dtype
+    ) -> torch.Tensor:
         # The destination owns its storage even when no cast is needed, so eviction is observable on CPU too.
-        out = torch.empty(source.shape, dtype=dtype, device=self.device)
+        out = torch.empty(source.shape, dtype=execution_dtype, device=self.device)
         flat_source, flat_out = source.reshape(-1), out.reshape(-1)
-        tile = self._staging_tile(dtype)
+        tile = self._staging_tile(execution_dtype)
         for start in range(0, flat_source.numel(), tile.numel()):
             elements = min(tile.numel(), flat_source.numel() - start)
-            tile[:elements].copy_(flat_source[start : start + elements])  # host-side cast into the tile
+            # `source -> operand dtype -> execution dtype`, the baseline's rounding sequence, one tile at a time:
+            # the intermediate is tile-sized, so a narrowing operand dtype never costs a second full head.
+            tile[:elements].copy_(flat_source[start : start + elements].to(operand_dtype))
             flat_out[start : start + elements].copy_(tile[:elements], non_blocking=False)  # completes before reuse
         return out
 

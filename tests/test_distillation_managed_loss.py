@@ -141,8 +141,9 @@ def _cache(case, device="cpu", staging_bytes=64 << 20):
     return cache
 
 
-def _managed(case, cache, *, beta, chunk_size, backward=True, **kwargs):
+def _managed(case, cache, *, beta, chunk_size, backward=True, evict_before_backward=False, **kwargs):
     """Run the managed loss on fresh grad-requiring copies of the student tensors; return outputs and gradients."""
+    kwargs.setdefault("num_teachers", len(case.specs) or 1)
     hidden = case.hidden.clone().requires_grad_(True)
     weight = case.weight.clone().requires_grad_(True)
     bias = None if case.bias is None else case.bias.clone().requires_grad_(True)
@@ -155,9 +156,10 @@ def _managed(case, cache, *, beta, chunk_size, backward=True, **kwargs):
         cache,
         beta,
         chunk_size,
-        num_teachers=len(case.specs) or 1,
         **kwargs,
     )
+    if evict_before_backward:
+        cache.evict_idle_gpu()
     if backward:
         outputs[0].backward()
     grads = (hidden.grad, weight.grad, None if bias is None else bias.grad)

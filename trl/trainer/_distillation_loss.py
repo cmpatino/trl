@@ -35,9 +35,9 @@ def _execution_dtype(hidden_dtype: torch.dtype, device: torch.device) -> torch.d
     The baseline matches the head weight to the hidden states' dtype and lets autocast take it from there. Under
     autocast the matmul therefore runs in the autocast dtype, and a head cached in the hidden states' dtype would be
     converted implicitly on every matmul — a second full head next to the cached one, defeating the one-head bound.
-    Casting the source straight to the value returned here reproduces the baseline's rounding: the intermediate
-    `source -> hidden dtype` step only ever widens (backbone hidden states are either the autocast dtype itself or
-    float32), so it never rounds away bits that the following cast would have kept.
+    The lease is therefore given both dtypes: it applies `source -> hidden dtype -> execution dtype` inside its
+    staging buffer, which reproduces the baseline's rounding sequence exactly (it matters whenever the hidden dtype is
+    narrow and differs from the autocast dtype, such as float16 targets under bfloat16 autocast).
 
     Args:
         hidden_dtype (`torch.dtype`):
@@ -75,7 +75,8 @@ def _managed_chunk(h_s, w_s, b_s, s_scale, s_softcap, h_t_cpu, identity, head_ca
         device = head_cache.device
         # The lease materializes the head in the dtype the matmul executes in, so the projection adds no cast of its
         # own; every use of the leased tensors finishes inside the block, which invalidates them on exit.
-        with head_cache.projection_lease(identity, _execution_dtype(h_t_cpu.dtype, device)) as head:
+        execution_dtype = _execution_dtype(h_t_cpu.dtype, device)
+        with head_cache.projection_lease(identity, execution_dtype, h_t_cpu.dtype) as head:
             h_t = h_t_cpu.to(device)
             teacher_logits = (h_t @ head.weight.t()).float()
             if head.bias is not None:
