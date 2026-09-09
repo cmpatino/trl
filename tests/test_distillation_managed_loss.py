@@ -18,7 +18,10 @@ Every test here runs on CPU. The properties CPU cannot observe (pinned staging t
 bound) have `require_torch_accelerator` variants, which are skipped — not validated — without an accelerator.
 """
 
+import contextlib
 import gc
+import threading
+import time
 import weakref
 from dataclasses import dataclass, field
 
@@ -30,6 +33,7 @@ from transformers import AutoModelForCausalLM
 from transformers.testing_utils import torch_device
 from transformers.utils import is_peft_available
 
+from trl.trainer import _distillation_loss
 from trl.trainer._distillation_heads import HeadIdentity, HeadSource, TargetGroup, TeacherHeadCache
 from trl.trainer._distillation_loss import managed_chunked_divergence_loss
 from trl.trainer.distillation_trainer import _chunked_divergence_loss
@@ -382,4 +386,113 @@ class TestManagedLossParity(TrlTestCase):
             updated.append([p.detach().clone() for p in student.parameters()])
         for managed_param, legacy_param in zip(*updated):
             torch.testing.assert_close(managed_param, legacy_param, atol=1e-6, rtol=1e-5)
+        cache.close()
+
+
+class _ChunkFailure(Exception):
+    """Application exception raised from inside the checkpointed chunk body."""
+
+
+class _FailingFunctional:
+    """`torch.nn.functional` stand-in that raises inside the chunk body after `after` `log_softmax` calls."""
+
+    def __init__(self, after):
+        self.after = after
+        self.calls = 0
+
+    def __getattr__(self, name):
+        return getattr(F, name)
+
+    def log_softmax(self, *args, **kwargs):
+        self.calls += 1
+        if self.calls > self.after:
+            raise _ChunkFailure("chunk body failed")
+        return F.log_softmax(*args, **kwargs)
+
+
+def _halves(group):
+    """Split a target group in two so a group list can alternate between two heads chunk by chunk."""
+    half = group.hidden.size(0) // 2
+    return [
+        TargetGroup(group.identity, group.teacher_index, group.hidden[:half].contiguous(), group.positions[:half]),
+        TargetGroup(group.identity, group.teacher_index, group.hidden[half:].contiguous(), group.positions[half:]),
+    ]
+
+
+class TestManagedLossPrecision(TrlTestCase):
+    """The cached head must sit in the dtype the matmul executes in, without changing the baseline's rounding."""
+
+    @pytest.mark.parametrize("hidden_dtype", [torch.float32, torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("autocast_dtype", [None, torch.bfloat16])
+    def test_cached_head_dtype_is_the_execution_dtype(self, hidden_dtype, autocast_dtype):
+        # The head source is float32 throughout; only the targets' dtype and the autocast context vary.
+        case = _case()
+        case.specs[0].hidden = case.specs[0].hidden.to(hidden_dtype)
+        cache = _cache(case)
+        context = contextlib.nullcontext() if autocast_dtype is None else torch.autocast("cpu", dtype=autocast_dtype)
+        with context:
+            _managed(case, cache, beta=0.5, chunk_size=4, backward=False)
+        assert cache._weight.dtype == (hidden_dtype if autocast_dtype is None else autocast_dtype)
+        # The bias is never rounded through the execution dtype.
+        assert cache._bias.dtype == torch.float32
+        cache.close()
+
+    @pytest.mark.parametrize("hidden_dtype", [torch.float32, torch.bfloat16, torch.float16])
+    def test_parity_under_bf16_autocast(self, hidden_dtype):
+        # A float32 head source under bfloat16 autocast, with a float32 bias whose values bfloat16 cannot hold.
+        # One teacher whose row count is a multiple of the chunk size, so the chunk boundaries match the legacy
+        # loss's and parity must be bit-exact rather than merely close.
+        case = _case(B=2, K=8, n_masked=0)
+        spec = case.specs[0]
+        spec.hidden = spec.hidden.to(hidden_dtype)
+        spec.bias = torch.full_like(spec.bias, 1.0 + 2.0**-10)
+        assert not torch.equal(spec.bias.to(torch.bfloat16).float(), spec.bias)
+        cache = _cache(case)
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            _assert_parity(
+                _managed(case, cache, beta=0.5, chunk_size=4),
+                _legacy(case, beta=0.5, chunk_size=4, denom=case.n_valid),
+                atol=0,
+                rtol=0,
+            )
+        cache.close()
+
+    def test_parity_under_bf16_autocast_with_several_teachers(self):
+        case = _case(B=2, K=8, n_masked=2, widths=(8, 5, 12), scales=(1.0, 1.3, 0.6), softcaps=(None, 30.0, 50.0))
+        for spec in case.specs:
+            spec.hidden = spec.hidden.to(torch.bfloat16)
+        cache = _cache(case)
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            _assert_parity(
+                _managed(case, cache, beta=0.5, chunk_size=4, temperature=2.0),
+                _legacy(case, beta=0.5, chunk_size=4, denom=case.n_valid, temperature=2.0),
+                atol=1e-5,
+                rtol=1e-4,
+            )
+        cache.close()
+
+    def test_bias_keeps_its_source_dtype_and_values(self):
+        case = _case()
+        spec = case.specs[0]
+        spec.bias = torch.full_like(spec.bias, 1.0 + 2.0**-10)  # not representable in bfloat16
+        cache = _cache(case)
+        with cache.projection_lease(spec.identity, torch.bfloat16, torch.float32) as head:
+            assert head.weight.dtype == torch.bfloat16
+            assert head.bias.dtype == torch.float32
+            assert torch.equal(head.bias, spec.bias)
+        cache.close()
+
+    def test_operand_dtype_is_part_of_the_cache_key(self):
+        # float32 -> float16 -> bfloat16 is not float32 -> bfloat16, so the two must not share a cache entry.
+        case = _case()
+        spec = case.specs[0]
+        cache = _cache(case)
+        with cache.projection_lease(spec.identity, torch.bfloat16, torch.float32) as head:
+            direct = head.weight.clone()
+        with cache.projection_lease(spec.identity, torch.bfloat16, torch.float16) as head:
+            two_stage = head.weight.clone()
+        assert cache.stats.misses == 2 and cache.stats.hits == 0
+        torch.testing.assert_close(direct, spec.weight.to(torch.bfloat16), atol=0, rtol=0)
+        torch.testing.assert_close(two_stage, spec.weight.to(torch.float16).to(torch.bfloat16), atol=0, rtol=0)
+        assert not torch.equal(direct, two_stage)
         cache.close()
