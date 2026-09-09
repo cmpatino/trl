@@ -228,6 +228,11 @@ class TeacherHeadCache:
             self._staging = None
             self._closed = True
 
+    def reopen(self) -> None:
+        """Allow leasing again after [`close`]; head sources are retained again by the executor on demand."""
+        with self._lock:
+            self._closed = False
+
     def _acquire(self, key: tuple) -> LeasedHead:
         with self._idle:
             if self._closed:

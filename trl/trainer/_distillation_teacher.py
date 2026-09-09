@@ -1412,6 +1412,11 @@ class WindowStore:
                 self._key_teachers[key].append(teacher_index)
                 self._block_refs[block.block_id] += 1
 
+    @property
+    def live_keys(self) -> list[tuple[int, int]]:
+        """Keys whose targets are scored and not yet released, so the trainer can refuse to close teachers."""
+        return sorted(self._targets)
+
     def targets_for(self, key: tuple[int, int], microbatch: dict | None = None) -> list[TargetGroup]:
         """
         Return the target groups of one microbatch as zero-copy views.
