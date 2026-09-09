@@ -650,3 +650,188 @@ class TestTeacherExecutor:
         # Restored for the student's own loading path.
         assert teacher_module.os.environ["ACCELERATE_USE_FSDP"] == "true"
         assert teacher_module.os.environ["FSDP_CPU_RAM_EFFICIENT_LOADING"] == "true"
+
+
+def make_window(sources, tokenizer, count=3, **executor_kwargs):
+    """A two-teacher registry, executor, store and `count` two-row microbatches routed one row per teacher."""
+    registry = make_registry({"early": sources["a"], "late": sources["a_v2"]}, tokenizer)
+    executor = make_executor(registry, scoring_batch_size=1, **executor_kwargs)
+    store = WindowStore(registry)
+    microbatches = [make_microbatch([0, 1], seed=10 + index) for index in range(count)]
+    return registry, executor, store, microbatches
+
+
+# Per microbatch: row 0 contributes 3 valid positions, row 1 contributes 2 (its last position is right padding).
+ROWS_PER_MICROBATCH = 5
+BLOCK_BYTES = HIDDEN_SIZE * 4
+
+
+class TestWindowStore:
+    def test_full_window_fits(self, sources, tokenizer):
+        registry, executor, store, microbatches = make_window(sources, tokenizer)
+        plan = store.plan_window(microbatches, target_cache_bytes=1 << 20)
+        assert plan.microbatch_indices == [0, 1, 2]
+        assert plan.teacher_indices == [0, 1]
+        assert plan.target_bytes == 3 * ROWS_PER_MICROBATCH * BLOCK_BYTES + 4096
+        assert plan.weight_bytes == 2 * registry["early"].head_bytes + max(
+            entry.storage_bytes + entry.loading_transient_bytes for entry in registry.entries
+        )
+        store.score_window(plan, executor, microbatches)
+        assert executor.stats.body_loads == 2  # one load per teacher present, not per microbatch
+        for index, microbatch in enumerate(microbatches):
+            groups = store.targets_for((0, index), microbatch)
+            assert [group.teacher_index for group in groups] == [0, 1]
+            assert [group.identity.teacher_id for group in groups] == ["early", "late"]
+            assert [group.positions.tolist() for group in groups] == [[0, 1, 2], [3, 4]]
+            early_reference, _ = reference_forward(sources["a"], microbatch)
+            late_reference, _ = reference_forward(sources["a_v2"], microbatch)
+            torch.testing.assert_close(groups[0].hidden, early_reference[groups[0].positions], rtol=1e-5, atol=1e-6)
+            torch.testing.assert_close(groups[1].hidden, late_reference[groups[1].positions], rtol=1e-5, atol=1e-6)
+
+    def test_groups_are_zero_copy_views_with_row_bookkeeping(self, sources, tokenizer):
+        registry, executor, store, microbatches = make_window(sources, tokenizer, count=1)
+        plan = store.plan_window(microbatches, target_cache_bytes=1 << 20)
+        store.score_window(plan, executor, microbatches)
+        block = next(iter(store._blocks.values()))
+        groups = store.targets_for((0, 0))
+        for group in groups:
+            assert group.hidden.untyped_storage().data_ptr() == block.hidden.untyped_storage().data_ptr()
+        assert block.row_samples == [
+            ("0:0:0", 0),
+            ("0:0:0", 1),
+            ("0:0:0", 2),
+            ("0:0:1", 0),
+            ("0:0:1", 1),
+        ]
+
+    def test_heterogeneous_widths_use_separate_blocks(self, sources, tokenizer):
+        registry = make_registry({"narrow": sources["a"], "wide": sources["wide"]}, tokenizer)
+        executor = make_executor(registry)
+        store = WindowStore(registry)
+        microbatches = [make_microbatch([0, 1], seed=21)]
+        plan = store.plan_window(microbatches, target_cache_bytes=1 << 20)
+        assert sorted(plan.block_rows) == [(HIDDEN_SIZE, torch.float32), (16, torch.float32)]
+        assert plan.target_bytes == 3 * HIDDEN_SIZE * 4 + 2 * 16 * 4 + 2 * 4096
+        store.score_window(plan, executor, microbatches)
+        narrow, wide = store.targets_for((0, 0))
+        assert narrow.hidden.shape == (3, HIDDEN_SIZE)
+        assert wide.hidden.shape == (2, 16)
+
+    def test_small_budget_shrinks_the_window(self, sources, tokenizer):
+        registry, executor, store, microbatches = make_window(sources, tokenizer)
+        two_microbatches = 2 * ROWS_PER_MICROBATCH * BLOCK_BYTES + 4096
+        plan = store.plan_window(microbatches, target_cache_bytes=two_microbatches)
+        assert plan.microbatch_indices == [0, 1]
+        assert plan.target_bytes == two_microbatches
+        store.score_window(plan, executor, microbatches)
+        store.targets_for((0, 1))
+        with pytest.raises(RuntimeError, match="no scored targets for \\(0, 2\\)"):
+            store.targets_for((0, 2))
+
+    def test_over_budget_microbatch_names_the_control(self, sources, tokenizer):
+        registry, executor, store, microbatches = make_window(sources, tokenizer)
+        with pytest.raises(ValueError, match="needs 4256 bytes but `teacher_target_cache_bytes` is 100"):
+            store.plan_window(microbatches, target_cache_bytes=100)
+        with pytest.raises(ValueError, match="`teacher_cpu_weight_budget_bytes` is 1000"):
+            store.plan_window(microbatches, target_cache_bytes=1 << 20, cpu_weight_budget_bytes=1000)
+
+    def test_weight_budget_shrinks_the_window(self, sources, tokenizer):
+        """A budget covering one teacher's head plus the largest body admits only single-teacher microbatches."""
+        registry = make_registry({"early": sources["a"], "late": sources["a_v2"]}, tokenizer)
+        executor = make_executor(registry)
+        store = WindowStore(registry)
+        microbatches = [make_microbatch([0, 0], seed=31), make_microbatch([1, 1], seed=32)]
+        budget = registry["early"].head_bytes + max(
+            entry.storage_bytes + entry.loading_transient_bytes for entry in registry.entries
+        )
+        plan = store.plan_window(microbatches, target_cache_bytes=1 << 20, cpu_weight_budget_bytes=budget)
+        assert plan.microbatch_indices == [0]
+        assert plan.teacher_indices == [0]
+
+    def test_exact_once_consumption(self, sources, tokenizer):
+        registry, executor, store, microbatches = make_window(sources, tokenizer, count=1)
+        plan = store.plan_window(microbatches, target_cache_bytes=1 << 20)
+        store.score_window(plan, executor, microbatches)
+        assert len(executor.head_cache.sources) == 2
+        store.targets_for((0, 0))
+        store.release((0, 0))
+        assert executor.head_cache.sources == {}  # last consumer dropped both head retentions
+        assert store._blocks == {}  # and the block
+        with pytest.raises(RuntimeError, match="already released"):
+            store.targets_for((0, 0))
+        with pytest.raises(RuntimeError, match="no scored targets"):
+            store.release((0, 0))
+        executor.close()
+
+    def test_fingerprint_mismatch_is_fatal(self, sources, tokenizer):
+        registry, executor, store, microbatches = make_window(sources, tokenizer, count=1)
+        plan = store.plan_window(microbatches, target_cache_bytes=1 << 20)
+        store.score_window(plan, executor, microbatches)
+        stale = dict(microbatches[0])
+        stale["completion_mask"] = torch.zeros_like(stale["completion_mask"])
+        with pytest.raises(RuntimeError, match="does not match the tokens and masks"):
+            store.targets_for((0, 0), stale)
+        shorter = dict(microbatches[0])
+        shorter["completion_ids"] = shorter["completion_ids"][:, :-1]
+        with pytest.raises(RuntimeError, match="does not match the tokens and masks"):
+            store.targets_for((0, 0), shorter)
+
+    def test_reset_drops_every_window(self, sources, tokenizer):
+        registry, executor, store, microbatches = make_window(sources, tokenizer, count=2)
+        plan = store.plan_window(microbatches, target_cache_bytes=1 << 20)
+        store.score_window(plan, executor, microbatches)
+        store.release((0, 0))
+        store.reset()
+        assert executor.head_cache.sources == {}
+        assert store._blocks == {}
+        with pytest.raises(RuntimeError, match="no scored targets"):
+            store.targets_for((0, 1))
+        executor.close()  # no retention survived the reset
+        # A renewed generation batch can be planned and scored again.
+        executor.reopen()
+        renewed = [make_microbatch([0, 1], seed=41)]
+        plan = store.plan_window(renewed, target_cache_bytes=1 << 20, generation_id=1)
+        store.score_window(plan, executor, renewed)
+        assert [group.teacher_index for group in store.targets_for((1, 0))] == [0, 1]
+
+    def test_overlapping_windows_are_rejected(self, sources, tokenizer):
+        registry, executor, store, microbatches = make_window(sources, tokenizer, count=1)
+        plan = store.plan_window(microbatches, target_cache_bytes=1 << 20)
+        store.score_window(plan, executor, microbatches)
+        with pytest.raises(RuntimeError, match="still live; release the previous window"):
+            store.score_window(plan, executor, microbatches)
+
+    def test_load_count_follows_teacher_presence(self, sources, tokenizer):
+        registry = make_registry(
+            {"early": sources["a"], "late": sources["a_v2"], "wide": sources["wide"]}, tokenizer
+        )
+        executor = make_executor(registry)
+        store = WindowStore(registry)
+        microbatches = [make_microbatch([0, 1], seed=51), make_microbatch([1, 0], seed=52)]
+        plan = store.plan_window(microbatches, target_cache_bytes=1 << 20)
+        assert plan.teacher_indices == [0, 1]  # the third teacher is registered but absent
+        store.score_window(plan, executor, microbatches)
+        assert executor.stats.body_loads == 2
+        assert executor.stats.cpu_reloads == 0
+        assert len(executor.head_cache.sources) == 2
+
+    def test_all_masked_microbatch_has_no_targets(self, sources, tokenizer):
+        registry, executor, store, microbatches = make_window(sources, tokenizer, count=1)
+        microbatches[0]["tool_mask"] = torch.zeros_like(microbatches[0]["completion_mask"])
+        plan = store.plan_window(microbatches, target_cache_bytes=1 << 20)
+        assert plan.groups == [] and plan.target_bytes == 0
+        store.score_window(plan, executor, microbatches)
+        assert store.targets_for((0, 0), microbatches[0]) == []
+        store.release((0, 0))
+
+    def test_zero_row_microbatch_is_rejected(self, sources, tokenizer):
+        registry, executor, store, _ = make_window(sources, tokenizer, count=1)
+        empty = {
+            "prompt_ids": torch.zeros(0, 4, dtype=torch.long),
+            "prompt_mask": torch.zeros(0, 4, dtype=torch.long),
+            "completion_ids": torch.zeros(0, 3, dtype=torch.long),
+            "completion_mask": torch.zeros(0, 3, dtype=torch.long),
+            "teacher_index": torch.zeros(0, dtype=torch.long),
+        }
+        with pytest.raises(ValueError, match="has no rows"):
+            store.plan_window([empty], target_cache_bytes=1 << 20)
