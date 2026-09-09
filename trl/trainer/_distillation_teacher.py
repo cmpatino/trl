@@ -287,6 +287,27 @@ def _dtype_bytes(dtype: torch.dtype) -> int:
     return torch.empty((), dtype=dtype).element_size()
 
 
+def _as_cpu(tensor):
+    """
+    Host copy of a generation-payload tensor, for the window store's host-side bookkeeping.
+
+    The generation payload lives on the accelerator, while planning, fingerprints, requested positions and target
+    blocks are host-side by contract: `TargetGroup.positions` must be a CPU int64 tensor that the managed loss moves
+    to the device itself, and the target blocks are CPU. Combining a device payload tensor with a host one silently
+    works when everything happens to be on CPU and raises `RuntimeError: Expected all tensors to be on the same
+    device` on an accelerator, so every boundary in this module converts explicitly rather than trusting the caller's
+    device. Already-host tensors are returned unchanged, so planning on CPU copies nothing.
+
+    Args:
+        tensor (`torch.Tensor`):
+            Payload tensor, on any device.
+
+    Returns:
+        `torch.Tensor`: the same tensor when it is already on the host, else a host copy.
+    """
+    return tensor if tensor.device.type == "cpu" else tensor.cpu()
+
+
 def _logit_transforms(text_config) -> tuple[float, float | None]:
     """Read the teacher's pre-softmax logit transformations, matching `DistillationTrainer._compute_loss`."""
     # `logit_scale` is None on models that don't scale (e.g. MPT); read that as unscaled (1.0). A real 0.0 is kept
@@ -920,6 +941,8 @@ class TargetWriter:
             hidden (`torch.Tensor`):
                 Scored rows `(n, H)` on the scoring device, in `rows[offset : offset + n]` order.
         """
+        # `hidden` may live on the accelerator while `staging` and `block.hidden` are host tensors, so the piece copy
+        # below is the device-to-host transfer; it is blocking, so the tile is safe to refill on the next iteration.
         count = hidden.shape[0]
         if offset + count > self.rows.numel():
             raise RuntimeError(
@@ -1115,7 +1138,9 @@ class TeacherExecutor:
         """
         self._check_open()
         entry = self.registry.entries[request.teacher_index]
-        positions = request.positions
+        # Requested positions are host bookkeeping (they index the reserved CPU block rows); the tokens may be on the
+        # accelerator, and each subbatch is moved to the scoring device below.
+        positions = _as_cpu(request.positions)
         if positions.numel() != writer.rows.numel():
             raise RuntimeError(
                 f"teacher '{entry.teacher_id}' was asked for {positions.numel()} targets but {writer.rows.numel()} "
@@ -1718,17 +1743,21 @@ class WindowStore:
         self._fingerprints.pop(key)
 
     def _microbatch_groups(self, microbatch: dict, index: int) -> list[_PlannedGroup]:
+        # Planning is host bookkeeping: the mask and the routing column are brought to the host once, up front, so the
+        # boolean algebra below never mixes a device payload tensor with a host one and `positions` comes out as the
+        # CPU int64 tensor `TargetGroup` promises.
         loss_mask = _loss_mask(microbatch)
         if loss_mask.shape[0] == 0:
             raise ValueError(
                 f"microbatch {index} has no rows; managed multi-teacher distillation requires nonempty scheduled "
                 "microbatches"
             )
+        teacher_index_column = _as_cpu(microbatch["teacher_index"])
         completion_length = loss_mask.shape[1]
-        row_teacher = microbatch["teacher_index"].repeat_interleave(completion_length)
+        row_teacher = teacher_index_column.repeat_interleave(completion_length)
         flat = loss_mask.reshape(-1) > 0
         groups = []
-        for teacher_index in sorted(set(microbatch["teacher_index"].tolist())):
+        for teacher_index in sorted(set(teacher_index_column.tolist())):
             entry = self.registry.entries[teacher_index]
             positions = (flat & (row_teacher == teacher_index)).nonzero().flatten()
             if positions.numel() > 0:
@@ -1751,24 +1780,32 @@ class WindowStore:
 
 
 def _loss_mask(microbatch: dict) -> torch.Tensor:
-    """Completion mask restricted to the positions the loss trains on, matching `DistillationTrainer._compute_loss`."""
+    """
+    Host copy of the completion mask restricted to the positions the loss trains on.
+
+    Matches `DistillationTrainer._compute_loss`'s `loss_mask`, and is moved to the host once (after the product, not
+    before) because every consumer here is host-side bookkeeping.
+    """
     completion_mask = microbatch["completion_mask"]
-    return completion_mask if "tool_mask" not in microbatch else completion_mask * microbatch["tool_mask"]
+    mask = completion_mask if "tool_mask" not in microbatch else completion_mask * microbatch["tool_mask"]
+    return _as_cpu(mask)
 
 
 def _microbatch_fingerprint(microbatch: dict) -> tuple:
-    """Token/mask shapes and content summary validated before targets are consumed."""
+    """Token/mask shapes and content summary validated before targets are consumed; plain Python values only."""
     loss_mask = _loss_mask(microbatch)
     return (
         tuple(microbatch["prompt_ids"].shape),
         tuple(microbatch["completion_ids"].shape),
         int(loss_mask.sum()),
-        tuple(int(index) for index in microbatch["teacher_index"]),
+        tuple(_as_cpu(microbatch["teacher_index"]).tolist()),
     )
 
 
 def _sample_ids(microbatch: dict, generation_id: int, microbatch_index: int) -> tuple:
     """Stable per-row IDs; synthesized from the window key when the generation payload carries none."""
     if "sample_ids" in microbatch:
-        return tuple(microbatch["sample_ids"])
+        sample_ids = microbatch["sample_ids"]
+        # A payload that carries its own IDs may carry them as a device tensor; block row bookkeeping needs values.
+        return tuple(_as_cpu(sample_ids).tolist() if isinstance(sample_ids, torch.Tensor) else sample_ids)
     return tuple(f"{generation_id}:{microbatch_index}:{row}" for row in range(microbatch["completion_ids"].shape[0]))
