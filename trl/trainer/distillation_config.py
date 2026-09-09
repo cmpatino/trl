@@ -47,6 +47,24 @@ class DistillationConfig(_BaseConfig):
         teacher_model_init_kwargs (`str` or `dict[str, Any]`, *optional*):
             Keyword arguments passed to `AutoModelForCausalLM.from_pretrained` when instantiating the teacher model
             from a string.
+        teacher_model_init_kwargs_by_teacher (`str` or `dict[str, dict[str, Any]]`, *optional*):
+            Per-teacher-ID overrides of `teacher_model_init_kwargs` for managed multi-teacher distillation (the
+            `teacher_models` mapping), e.g. `{"early": {"revision": "<A>"}, "late": {"revision": "<B>"}}`. Common
+            loading kwargs from `teacher_model_init_kwargs` apply first, then the per-ID overrides for that
+            teacher's ID.
+        teacher_target_cache_bytes (`int`, *optional*, defaults to `1024**3`):
+            Per-rank byte budget for the CPU-resident window of teacher hidden targets, for managed multi-teacher
+            distillation. Excludes teacher weights.
+        teacher_scoring_batch_size (`int`, *optional*, defaults to `1`):
+            Maximum number of rows scored in one teacher forward pass, for managed multi-teacher distillation.
+        teacher_cpu_weight_budget_bytes (`int`, *optional*):
+            Cap, in bytes, on CPU-resident teacher model weights and retained head sources, for managed multi-teacher
+            distillation. If `None`, there is no explicit cap, though the trainer still keeps only one reloadable
+            teacher body on CPU at a time.
+        teacher_gpu_weight_budget_bytes (`int`, *optional*):
+            Cap, in bytes, on managed GPU-resident teacher weights, for managed multi-teacher distillation. If
+            `None`, there is no explicit cap, though the trainer still keeps only one scoring teacher or head on GPU
+            at a time.
         disable_dropout (`bool`, *optional*, defaults to `False`):
             Whether to disable dropout in the student model during training.
 
@@ -163,6 +181,7 @@ class DistillationConfig(_BaseConfig):
     _VALID_DICT_FIELDS = _BaseConfig._VALID_DICT_FIELDS + [
         "model_init_kwargs",
         "teacher_model_init_kwargs",
+        "teacher_model_init_kwargs_by_teacher",
         "generation_kwargs",
         "chat_template_kwargs",
     ]
@@ -201,6 +220,45 @@ class DistillationConfig(_BaseConfig):
         default=None,
         metadata={
             "help": "Keyword arguments for `AutoModelForCausalLM.from_pretrained` when instantiating the teacher."
+        },
+    )
+    teacher_model_init_kwargs_by_teacher: dict[str, dict[str, Any]] | str | None = field(
+        default=None,
+        metadata={
+            "help": "Per-teacher-ID overrides of `teacher_model_init_kwargs` for managed multi-teacher distillation "
+            "(the `teacher_models` mapping), e.g. {'early': {'revision': '<commit-A>'}, 'late': {'revision': "
+            "'<commit-B>'}}. Common loading kwargs from `teacher_model_init_kwargs` apply first, then the per-ID "
+            "overrides for that teacher's ID."
+        },
+    )
+    teacher_target_cache_bytes: int = field(
+        default=1 << 30,
+        metadata={
+            "help": "Per-rank byte budget for the CPU-resident window of teacher hidden targets, for managed "
+            "multi-teacher distillation. Excludes teacher weights."
+        },
+    )
+    teacher_scoring_batch_size: int = field(
+        default=1,
+        metadata={
+            "help": "Maximum number of rows scored in one teacher forward pass, for managed multi-teacher "
+            "distillation."
+        },
+    )
+    teacher_cpu_weight_budget_bytes: int | None = field(
+        default=None,
+        metadata={
+            "help": "Cap, in bytes, on CPU-resident teacher model weights and retained head sources, for managed "
+            "multi-teacher distillation. If `None`, there is no explicit cap, though the trainer still keeps only "
+            "one reloadable teacher body on CPU at a time."
+        },
+    )
+    teacher_gpu_weight_budget_bytes: int | None = field(
+        default=None,
+        metadata={
+            "help": "Cap, in bytes, on managed GPU-resident teacher weights, for managed multi-teacher distillation. "
+            "If `None`, there is no explicit cap, though the trainer still keeps only one scoring teacher or head on "
+            "GPU at a time."
         },
     )
     disable_dropout: bool = field(
@@ -404,3 +462,30 @@ class DistillationConfig(_BaseConfig):
                 "sharding cannot be applied to the raw generation batch. Set both `cp_size=1` and `sp_size=1`, "
                 "or disable `parallelism_config`."
             )
+
+        # Managed multi-teacher (MOPD) validation. `teacher_models` vs. `teacher_model`/`teacher_model_name_or_path`
+        # mutual exclusivity is a trainer-level check (it needs the trainer's `teacher_models` argument, not just
+        # this config), not performed here.
+        if self.teacher_target_cache_bytes <= 0:
+            raise ValueError(f"teacher_target_cache_bytes must be positive, got {self.teacher_target_cache_bytes}.")
+
+        if self.teacher_scoring_batch_size <= 0:
+            raise ValueError(f"teacher_scoring_batch_size must be positive, got {self.teacher_scoring_batch_size}.")
+
+        if self.teacher_cpu_weight_budget_bytes is not None and self.teacher_cpu_weight_budget_bytes <= 0:
+            raise ValueError(
+                f"teacher_cpu_weight_budget_bytes must be positive, got {self.teacher_cpu_weight_budget_bytes}."
+            )
+
+        if self.teacher_gpu_weight_budget_bytes is not None and self.teacher_gpu_weight_budget_bytes <= 0:
+            raise ValueError(
+                f"teacher_gpu_weight_budget_bytes must be positive, got {self.teacher_gpu_weight_budget_bytes}."
+            )
+
+        if self.teacher_model_init_kwargs_by_teacher is not None:
+            for teacher_id, kwargs in self.teacher_model_init_kwargs_by_teacher.items():
+                if not isinstance(kwargs, dict):
+                    raise ValueError(
+                        "teacher_model_init_kwargs_by_teacher must map each teacher ID to a dict of keyword "
+                        f"arguments, got {type(kwargs).__name__} for teacher ID {teacher_id!r}."
+                    )
