@@ -54,6 +54,8 @@ _TRANSFORM_VERSION = 1
 _TARGET_BLOCK_OVERHEAD_BYTES = 4096
 # Rows per staging tile fill. One tile is reused for every block; copies block until complete (`non_blocking=False`).
 _STAGING_ROWS = 256
+# Block size for the streaming content digests of checkpoint files and preloaded tensors.
+_HASH_BLOCK_BYTES = 8 << 20
 
 
 def _canonical_json(payload) -> str:
@@ -72,13 +74,86 @@ def _safetensors_header(path: Path) -> dict:
         return json.loads(handle.read(length))
 
 
+def _checkpoint_files(path: str) -> list[Path]:
+    """The immutable files that define a local checkpoint's content: `config.json` then its safetensors shards."""
+    root = Path(path)
+    config_path = root / "config.json"
+    if not config_path.is_file():
+        raise ValueError(f"Teacher checkpoint '{path}' has no config.json.")
+    weight_files = sorted(root.glob("*.safetensors"))
+    if not weight_files:
+        raise ValueError(
+            f"Teacher checkpoint '{path}' contains no safetensors weight file. Managed multi-teacher distillation "
+            "reloads teacher bodies from immutable safetensors snapshots; re-save the checkpoint with "
+            "`save_pretrained`."
+        )
+    return [config_path, *weight_files]
+
+
+def _content_digest(path: str) -> tuple[str, int]:
+    """
+    Stream a local checkpoint's bytes through sha256 in bounded blocks.
+
+    Tensor *values* are part of the digest: headers, shapes, dtypes, sizes and timestamps do not change when weights
+    are overwritten in place, and a local path is mutable. The executor recomputes this before every body reload, so
+    the cost (reported as `ExecutorStats.verify_bytes`) is one extra read of the checkpoint per reload.
+
+    Args:
+        path (`str`):
+            Local checkpoint directory.
+
+    Returns:
+        `tuple[str, int]`: hex sha256 digest and the number of bytes hashed.
+    """
+    digest = hashlib.sha256()
+    hashed = 0
+    for file_path in _checkpoint_files(path):
+        digest.update(file_path.name.encode("utf-8"))
+        with file_path.open("rb") as handle:
+            while True:
+                block = handle.read(_HASH_BLOCK_BYTES)
+                if not block:
+                    break
+                digest.update(block)
+                hashed += len(block)
+    return digest.hexdigest(), hashed
+
+
+def _tensor_content_digest(model: PreTrainedModel) -> tuple[str, int]:
+    """
+    Stream a preloaded model's parameter and buffer values through sha256 in bounded blocks.
+
+    A caller-provided model has no file identity, so its values are its identity: without them two models sharing a
+    config and parameter shapes would resolve to the same source, and manifest validation could not reject a changed
+    teacher on resume.
+
+    Args:
+        model ([`~transformers.PreTrainedModel`]):
+            CPU model to fingerprint. Tensors are read in `state_dict()` key order.
+
+    Returns:
+        `tuple[str, int]`: hex sha256 digest and the number of tensor bytes hashed.
+    """
+    digest = hashlib.sha256()
+    hashed = 0
+    for name, tensor in model.state_dict().items():
+        digest.update(f"{name}|{tensor.dtype}|{tuple(tensor.shape)}".encode())
+        flat = tensor.detach().to("cpu").reshape(-1)
+        block_elements = max(1, _HASH_BLOCK_BYTES // flat.element_size())
+        for start in range(0, flat.numel(), block_elements):
+            block = flat[start : start + block_elements].contiguous().view(torch.uint8).numpy().tobytes()
+            digest.update(block)
+            hashed += len(block)
+    return digest.hexdigest(), hashed
+
+
 def _checkpoint_inventory(path: str) -> dict:
     """
     Inventory a local checkpoint directory from its safetensors headers, without materializing any weights.
 
-    The inventory is the content identity of a local source and the basis for its storage/transient accounting. It is
-    cheap and deterministic, but header-level: two checkpoints whose tensors differ in value only are distinguished by
-    their path or resolved revision, which are part of `source_key` as well.
+    The inventory is the basis for a local source's storage and loading-transient accounting; its content identity is
+    the streaming `content_digest`, which covers tensor values, because a local path is mutable and headers, sizes and
+    timestamps do not change when weights are overwritten in place.
 
     Args:
         path (`str`):
@@ -96,18 +171,12 @@ def _checkpoint_inventory(path: str) -> dict:
                 Total number of checkpoint elements.
             - `largest_file_bytes` (`int`):
                 Size of the largest weight file, used as the loading transient estimate.
+            - `content_digest` (`str`):
+                Streaming sha256 over `config.json` and every safetensors file, tensor values included.
+            - `hashed_bytes` (`int`):
+                Bytes hashed to produce `content_digest`.
     """
-    root = Path(path)
-    config_path = root / "config.json"
-    if not config_path.is_file():
-        raise ValueError(f"Teacher checkpoint '{path}' has no config.json.")
-    weight_files = sorted(root.glob("*.safetensors"))
-    if not weight_files:
-        raise ValueError(
-            f"Teacher checkpoint '{path}' contains no safetensors weight file. Managed multi-teacher distillation "
-            "reloads teacher bodies from immutable safetensors snapshots; re-save the checkpoint with "
-            "`save_pretrained`."
-        )
+    config_path, *weight_files = _checkpoint_files(path)
     tensors = {}
     files = []
     numel = 0
@@ -122,12 +191,15 @@ def _checkpoint_inventory(path: str) -> dict:
                 count *= dim
             numel += count
         files.append([weight_file.name, weight_file.stat().st_size, _sha256_json(header)])
+    content_digest, hashed_bytes = _content_digest(path)
     return {
         "tensors": tensors,
         "files": files,
         "config_digest": hashlib.sha256(config_path.read_bytes()).hexdigest(),
         "numel": numel,
         "largest_file_bytes": max(entry[1] for entry in files),
+        "content_digest": content_digest,
+        "hashed_bytes": hashed_bytes,
     }
 
 
@@ -235,8 +307,14 @@ class TeacherEntry:
     """
     Everything the trainer knows about one registered teacher, independent of any loaded model object.
 
-    `hidden_dtype` and `projection_dtype` are the scoring precision policy: the executor records them at construction
-    from its autocast setting and the source dtype, and hidden targets are stored in `hidden_dtype`.
+    Three dtypes are kept apart on purpose. `source_dtype` is what the CPU source materializes in. `target_dtype` is
+    what hidden targets are stored in (the executor's autocast dtype when set, otherwise `source_dtype`), and window
+    planning sizes blocks with it. `hidden_dtype` is the dtype the backbone actually returned: it stays `None` until a
+    forward has been observed (by scoring or by [`~TeacherExecutor.probe_hidden_dtype`]) and is never inferred from
+    configuration. `projection_dtype` is the matmul execution dtype the managed loss reproduces on replay.
+
+    `content_digest` is the source's value-level identity: a streaming digest of the checkpoint files for path/Hub
+    sources, or of the parameter and buffer values for a preloaded model.
     """
 
     teacher_id: str
@@ -248,7 +326,8 @@ class TeacherEntry:
     hidden_size: int
     vocab_size: int
     source_dtype: torch.dtype
-    hidden_dtype: torch.dtype
+    target_dtype: torch.dtype
+    hidden_dtype: torch.dtype | None
     projection_dtype: torch.dtype
     tokenizer_fingerprint: str
     head_identity: HeadIdentity
@@ -258,6 +337,8 @@ class TeacherEntry:
     load_path: str | None
     loading_kwargs: dict
     loading_transient_bytes: int
+    content_digest: str
+    content_hashed_bytes: int
 
     @property
     def head_bytes(self) -> int:
@@ -407,8 +488,9 @@ class TeacherRegistry:
                 "hidden_size": entry.hidden_size,
                 "vocab_size": entry.vocab_size,
                 "source_dtype": str(entry.source_dtype),
-                "hidden_dtype": str(entry.hidden_dtype),
+                "target_dtype": str(entry.target_dtype),
                 "projection_dtype": str(entry.projection_dtype),
+                "content_digest": entry.content_digest,
                 "tokenizer_fingerprint": entry.tokenizer_fingerprint,
                 "weight_shape": list(entry.head_identity.weight_shape),
                 "has_bias": entry.head_identity.has_bias,
@@ -425,7 +507,10 @@ class TeacherRegistry:
         """
         Allowlisted registry description consumed by [`TeacherManifest.from_registry`]; never contains credentials.
 
-        Dtypes stay `torch.dtype` objects and `head["weight_shape"]` a tuple: `from_registry` serializes them.
+        Dtypes stay `torch.dtype` objects and `head["weight_shape"]` a tuple: `from_registry` serializes them. The
+        allowlisted `hidden_dtype` is the observed backbone output dtype once a forward has been seen and the planned
+        `target_dtype` before that; `hidden_dtype_observed` says which, and `target_dtype` is reported separately so
+        the source -> hidden -> target chain stays visible.
 
         Returns:
             `dict` with keys:
@@ -440,7 +525,8 @@ class TeacherRegistry:
                     `resolved_revision`, `source_key`, `tokenizer_fingerprint`, `source_dtype`, `hidden_dtype`,
                     `projection_dtype`, `adapter_version`, `head` (`weight_shape`, `has_bias`, `source_dtype`,
                     `logit_scale`, `final_logit_softcapping`, `transform_version`), plus the registry's own
-                    `config_class`, `hidden_size`, `vocab_size`, `evictable`, `storage_bytes` and allowlisted
+                    `config_class`, `hidden_size`, `vocab_size`, `target_dtype`, `hidden_dtype_observed`,
+                    `content_digest`, `content_hashed_bytes`, `evictable`, `storage_bytes` and allowlisted
                     `loading` kwargs.
         """
         teachers = []
@@ -460,9 +546,13 @@ class TeacherRegistry:
                     "hidden_size": entry.hidden_size,
                     "vocab_size": entry.vocab_size,
                     "source_dtype": entry.source_dtype,
-                    "hidden_dtype": entry.hidden_dtype,
+                    "hidden_dtype": entry.hidden_dtype or entry.target_dtype,
+                    "hidden_dtype_observed": entry.hidden_dtype is not None,
+                    "target_dtype": entry.target_dtype,
                     "projection_dtype": entry.projection_dtype,
                     "adapter_version": entry.adapter_version,
+                    "content_digest": entry.content_digest,
+                    "content_hashed_bytes": entry.content_hashed_bytes,
                     "head": {
                         "weight_shape": entry.head_identity.weight_shape,
                         "has_bias": entry.head_identity.has_bias,
@@ -522,6 +612,7 @@ class TeacherRegistry:
                 "source": source,
                 "revision": resolved_revision,
                 "content": {
+                    "digest": inventory["content_digest"],
                     "config": inventory["config_digest"],
                     "files": inventory["files"],
                     "tensors": inventory["tensors"],
@@ -551,6 +642,8 @@ class TeacherRegistry:
             load_path=load_path,
             loading_kwargs=loading_kwargs,
             loading_transient_bytes=inventory["largest_file_bytes"],
+            content_digest=inventory["content_digest"],
+            content_hashed_bytes=inventory["hashed_bytes"],
         )
 
     def _register_preloaded(
@@ -581,12 +674,14 @@ class TeacherRegistry:
         head = model.get_output_embeddings()
         config = model.config
         text_config = config.get_text_config()
+        content_digest, hashed_bytes = _tensor_content_digest(model)
         source_key = _sha256_json(
             {
                 "kind": "preloaded",
-                # A caller model has no immutable file identity, so the routing ID pins it: a preloaded source is
-                # never shared between two entries.
+                # A caller model has no file identity, so the routing ID pins the slot and the streamed parameter and
+                # buffer values pin the content: re-supplying an equal model on resume matches, a changed one does not.
                 "teacher_id": teacher_id,
+                "content": content_digest,
                 "config": json.loads(config.to_json_string(use_diff=False)),
                 "parameters": sorted(
                     [name, str(tensor.dtype), list(tensor.shape)] for name, tensor in model.named_parameters()
@@ -618,6 +713,8 @@ class TeacherRegistry:
             load_path=None,
             loading_kwargs={},
             loading_transient_bytes=0,
+            content_digest=content_digest,
+            content_hashed_bytes=hashed_bytes,
         )
 
     def _build_entry(
@@ -639,6 +736,8 @@ class TeacherRegistry:
         load_path,
         loading_kwargs,
         loading_transient_bytes,
+        content_digest,
+        content_hashed_bytes,
     ) -> TeacherEntry:
         if text_config.vocab_size != self.student_vocab_size:
             raise ValueError(
@@ -681,7 +780,8 @@ class TeacherRegistry:
             hidden_size=weight_shape[1],
             vocab_size=text_config.vocab_size,
             source_dtype=source_dtype,
-            hidden_dtype=source_dtype,
+            target_dtype=source_dtype,
+            hidden_dtype=None,
             projection_dtype=source_dtype,
             tokenizer_fingerprint=fingerprint,
             head_identity=head_identity,
@@ -691,6 +791,8 @@ class TeacherRegistry:
             load_path=load_path,
             loading_kwargs=loading_kwargs,
             loading_transient_bytes=loading_transient_bytes,
+            content_digest=content_digest,
+            content_hashed_bytes=content_hashed_bytes,
         )
 
 
@@ -817,6 +919,7 @@ class ExecutorStats:
     body_loads: int = 0
     cpu_reloads: int = 0
     disk_bytes: int = 0
+    verify_bytes: int = 0
     backbone_uploads: int = 0
     upload_bytes: int = 0
     upload_seconds: float = 0.0
@@ -889,10 +992,11 @@ class TeacherExecutor:
         self.staging_rows = staging_rows
         self.capabilities = {"hidden_targets": True, "requires_collective_schedule": False}
         self.stats = ExecutorStats()
-        # Recorded precision policy: hidden targets are stored in `hidden_dtype`, and `projection_dtype` is the matmul
-        # execution dtype the managed loss must reproduce on replay.
+        # Recorded precision policy: targets are stored in `target_dtype` and `projection_dtype` is the matmul
+        # execution dtype the managed loss reproduces on replay. `hidden_dtype` stays unset until a real forward (or
+        # `probe_hidden_dtype`) shows what the backbone returns; it is never inferred from configuration.
         for entry in registry.entries:
-            entry.hidden_dtype = autocast_dtype or entry.source_dtype
+            entry.target_dtype = autocast_dtype or entry.source_dtype
             entry.projection_dtype = autocast_dtype or entry.source_dtype
         self._body: PreTrainedModel | None = None
         self._body_key: str | None = None
@@ -992,6 +1096,7 @@ class TeacherExecutor:
                         strict=True,
                     )
                 hidden = output.last_hidden_state
+                self._record_hidden_dtype(entry, hidden.dtype)
                 if hidden.shape[1] != input_ids.shape[1]:
                     raise RuntimeError(
                         f"teacher '{entry.teacher_id}' returned {hidden.shape[1]} hidden states for "
@@ -1016,6 +1121,62 @@ class TeacherExecutor:
                 f"teacher '{entry.teacher_id}' scored {offset} of {positions.numel()} requested targets"
             )
         return ScoreResult(request.teacher_index, offset, entry.hidden_dtype, forward_calls)
+
+    def probe_hidden_dtype(self, index: int) -> torch.dtype:
+        """
+        Observe teacher `index`'s backbone output dtype with a two-token forward under the recorded autocast policy.
+
+        The trainer can call this before planning a window or saving a manifest so the entry carries a measured
+        `hidden_dtype` instead of a configuration guess. Scoring records the same value on its first forward, so this
+        is optional.
+
+        Args:
+            index (`int`):
+                Registry index.
+
+        Returns:
+            `torch.dtype`: the dtype the backbone returned.
+        """
+        self._check_open()
+        entry = self.registry.entries[index]
+        backbone = _teacher_backbone(self._load_body(index))
+        device_state, device_bytes = self._device_state(backbone)
+        try:
+            input_ids = torch.zeros((1, 2), dtype=torch.long, device=self.device)
+            with torch.no_grad(), self._autocast():
+                output = torch.func.functional_call(
+                    backbone,
+                    device_state,
+                    args=(),
+                    kwargs={
+                        "input_ids": input_ids,
+                        "attention_mask": torch.ones_like(input_ids),
+                        "use_cache": False,
+                    },
+                    tie_weights=True,
+                    strict=True,
+                )
+            self._record_hidden_dtype(entry, output.last_hidden_state.dtype)
+        finally:
+            device_state.clear()
+            self.stats.live_device_weight_bytes -= device_bytes
+        return entry.hidden_dtype
+
+    def _record_hidden_dtype(self, entry: TeacherEntry, dtype: torch.dtype) -> None:
+        """Record the dtype the backbone actually returned, before any conversion into the target block dtype."""
+        if entry.hidden_dtype is None:
+            entry.hidden_dtype = dtype
+            logger.debug(
+                "Teacher '%s' backbone returns %s; targets are stored as %s",
+                entry.teacher_id,
+                dtype,
+                entry.target_dtype,
+            )
+        elif entry.hidden_dtype != dtype:
+            raise RuntimeError(
+                f"teacher '{entry.teacher_id}' returned {dtype} hidden states but {entry.hidden_dtype} was recorded "
+                "earlier; the scoring precision policy must be identical for every forward"
+            )
 
     def target_writer(self, block: HiddenTargetBlock, rows: torch.Tensor) -> TargetWriter:
         """Bind a writer for `rows` of `block` to the staging tile, reallocating the tile when its shape changes."""
@@ -1084,6 +1245,16 @@ class TeacherExecutor:
                 f"non-evictable models, its {entry.storage_bytes}-byte body and a "
                 f"{entry.loading_transient_bytes}-byte loading transient) but `teacher_cpu_weight_budget_bytes` is "
                 f"{budget}."
+            )
+        digest, hashed = _content_digest(entry.load_path)
+        self.stats.verify_bytes += hashed
+        if digest != entry.content_digest:
+            raise ValueError(
+                f"The checkpoint of teacher '{entry.teacher_id}' at '{entry.load_path}' changed since registration "
+                f"(content digest {digest[:12]}... instead of {entry.content_digest[:12]}...). Managed multi-teacher "
+                "distillation pins immutable sources: retained head sources, cached targets and the saved manifest "
+                "all describe the registered content. Point the teacher at an immutable snapshot, or restart training "
+                "so it is registered again."
             )
         loading_kwargs = {key: value for key, value in entry.loading_kwargs.items() if key != "revision"}
         loading_kwargs["dtype"] = entry.source_dtype
@@ -1486,7 +1657,7 @@ class WindowStore:
             entry = self.registry.entries[teacher_index]
             positions = (flat & (row_teacher == teacher_index)).nonzero().flatten()
             if positions.numel() > 0:
-                groups.append(_PlannedGroup(index, teacher_index, positions, (entry.hidden_size, entry.hidden_dtype)))
+                groups.append(_PlannedGroup(index, teacher_index, positions, (entry.hidden_size, entry.target_dtype)))
         return groups
 
     def _target_bytes(self, groups: list[_PlannedGroup]) -> int:

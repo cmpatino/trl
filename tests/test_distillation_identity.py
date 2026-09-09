@@ -51,6 +51,26 @@ class TestTokenizerFingerprint(TrlTestCase):
 
         assert tokenizer_fingerprint(tokenizer_a) == tokenizer_fingerprint(tokenizer_b)
 
+    def test_fingerprint_stable_across_padded_truncated_calls(self):
+        tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_ID)
+
+        fingerprint_before = tokenizer_fingerprint(tokenizer)
+        # An ordinary padded/truncated batch call mutates the fast tokenizer's backend `padding`/`truncation`
+        # serialization in place; the fingerprint must not depend on this transient call-time state.
+        tokenizer(["a b", "a"], padding=True, truncation=True, max_length=4)
+        fingerprint_after = tokenizer_fingerprint(tokenizer)
+
+        assert fingerprint_before == fingerprint_after
+
+    def test_fingerprint_stable_after_max_length_padding_call(self):
+        tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_ID)
+
+        fingerprint_before = tokenizer_fingerprint(tokenizer)
+        tokenizer(["a b", "a"], padding="max_length", max_length=8)
+        fingerprint_after = tokenizer_fingerprint(tokenizer)
+
+        assert fingerprint_before == fingerprint_after
+
     def test_cosmetic_json_formatting_does_not_change_fingerprint(self):
         tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_ID)
 
@@ -100,6 +120,8 @@ class TestTokenizerFingerprint(TrlTestCase):
         assert payload["model_input_names"] == tokenizer.model_input_names
         assert "padding_side" not in payload
         assert "truncation_side" not in payload
+        assert "padding" not in payload
+        assert "truncation" not in payload
 
 
 def _registry_manifest() -> dict:
