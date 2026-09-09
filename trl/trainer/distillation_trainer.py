@@ -808,17 +808,6 @@ class DistillationTrainer(_BaseTrainer):
                 student_model=self.accelerator.unwrap_model(self.model),
                 trust_remote_code=args.trust_remote_code,
             )
-            # Scoring runs in `_prepare_inputs`, outside the student wrapper's precision context, so the intended
-            # autocast dtype has to be passed to the executor explicitly (design "Preserve the objective and
-            # numerical behavior"). Read it from the very context the student loss runs in rather than from
-            # `accelerator.mixed_precision`: the two disagree whenever Trainer declines to autocast (CPU training
-            # with `bf16=True`, for instance), and scoring in a precision the student loss never uses would make the
-            # teacher targets differ from what the single-teacher path computes.
-            device_type = self.accelerator.device.type
-            with self.compute_loss_context_manager():
-                scoring_autocast_dtype = (
-                    torch.get_autocast_dtype(device_type) if torch.is_autocast_enabled(device_type) else None
-                )
             self._teacher_head_cache = TeacherHeadCache(self.accelerator.device)
             self._teacher_executor = TeacherExecutor(
                 self._teacher_registry,
@@ -827,7 +816,7 @@ class DistillationTrainer(_BaseTrainer):
                 cpu_weight_budget_bytes=args.teacher_cpu_weight_budget_bytes,
                 gpu_weight_budget_bytes=args.teacher_gpu_weight_budget_bytes,
                 scoring_batch_size=args.teacher_scoring_batch_size,
-                autocast_dtype=scoring_autocast_dtype,
+                autocast_dtype=self._scoring_autocast_dtype(),
             )
             # Measure every teacher's backbone output dtype now and store targets in it, so the targets are exactly
             # what the teacher computed (the single-teacher path keeps them that way too) and so an unloadable
@@ -971,6 +960,36 @@ class DistillationTrainer(_BaseTrainer):
                 generation_kwargs=args.generation_kwargs,
             )
             self._last_loaded_step = -1  # tag to avoid useless loading during grad accumulation
+
+    def _scoring_autocast_dtype(self) -> torch.dtype | None:
+        """
+        Precision the managed teachers are scored in: the one the student's loss really computes in.
+
+        Scoring happens in `_prepare_inputs`, outside the student wrapper's precision context, so the executor has
+        to be told the dtype explicitly (design "Preserve the objective and numerical behavior"). It is read from the
+        very context the loss runs in rather than from `accelerator.mixed_precision`, because the two disagree
+        whenever Trainer declines to autocast — CPU training with `bf16=True`, for instance — and scoring in a
+        precision the loss never uses would make the teacher targets differ from what the single-teacher path
+        computes.
+
+        DeepSpeed is the other direction: the engine does the mixed precision itself, so
+        `compute_loss_context_manager()` is a null context there while the student still computes in the engine's
+        dtype. Scoring in float32 under a bf16 engine would put the teachers in a different precision class from the
+        student they are targets for, so the plugin's dtype is used instead. Note what this does and does not do: it
+        makes the teacher's *matmuls* run in the engine's dtype, while every non-matmul op (embeddings, norms) still
+        runs in the teacher's registered `source_dtype`. To put a teacher entirely in the engine's precision,
+        register it that way — `args.teacher_model_init_kwargs = {"dtype": "bfloat16"}`.
+
+        Returns:
+            `torch.dtype` or `None`: the autocast dtype for teacher scoring, or `None` for no autocast.
+        """
+        device_type = self.accelerator.device.type
+        with self.compute_loss_context_manager():
+            if torch.is_autocast_enabled(device_type):
+                return torch.get_autocast_dtype(device_type)
+        if self.is_deepspeed_enabled:
+            return {"fp16": torch.float16, "bf16": torch.bfloat16}.get(self.accelerator.mixed_precision)
+        return None
 
     def _check_managed_backend(self, teacher_model_init_kwargs: dict):
         """

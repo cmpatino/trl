@@ -16,6 +16,7 @@
 
 import json
 import os
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -460,6 +461,43 @@ class TestManagedDeviceBoundaries(TrlTestCase):
 
         trainer._teacher_store.release(inputs["_teacher_targets_key"])
         trainer.close_teachers()
+
+    def test_scoring_autocast_dtype_follows_the_loss_context_then_deepspeed(self, teachers):
+        # The teachers must be scored in the precision the student's loss really computes in. Two sources disagree
+        # and both matter: `Trainer.compute_loss_context_manager()` is authoritative when it autocasts, but under
+        # DeepSpeed it is a null context while the engine still computes in bf16, so the plugin's dtype has to be
+        # used there. Getting this wrong made the ZeRO gates score fp32 teachers against a bf16 student.
+        training_args = DistillationConfig(
+            output_dir=self.tmp_dir, per_device_train_batch_size=1, max_completion_length=2, report_to="none"
+        )
+        trainer = DistillationTrainer(
+            model=MODEL_ID,
+            args=training_args,
+            train_dataset=_routed_dataset(["a"]),
+            teacher_models={"a": teachers["a"]},
+        )
+        # This CPU environment autocasts nowhere and is not DeepSpeed, so no autocast: what the executor was built
+        # with, and what makes managed-vs-legacy parity bitwise here.
+        assert trainer._scoring_autocast_dtype() is None
+        assert trainer._teacher_executor.autocast_dtype is None
+
+        # A null loss context plus a DeepSpeed engine: take the dtype from the plugin. `mixed_precision` is a
+        # read-only property, so it is patched on the class for the duration of each check.
+        accelerator_type = type(trainer.accelerator)
+        trainer.is_deepspeed_enabled = True
+        for precision, expected in (("bf16", torch.bfloat16), ("fp16", torch.float16), ("no", None)):
+            with patch.object(accelerator_type, "mixed_precision", precision):
+                assert trainer._scoring_autocast_dtype() is expected, precision
+
+        # An autocasting loss context wins over the plugin, whichever backend is active.
+        with patch.object(accelerator_type, "mixed_precision", "bf16"):
+            with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+                assert trainer._scoring_autocast_dtype() is torch.bfloat16
+            trainer.is_deepspeed_enabled = False
+            with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+                assert trainer._scoring_autocast_dtype() is torch.bfloat16
+            # Not DeepSpeed and no autocast: no autocast for scoring either.
+            assert trainer._scoring_autocast_dtype() is None
 
     def test_as_cpu_converts_only_non_host_tensors(self):
         host = torch.zeros(3, dtype=torch.int64)
