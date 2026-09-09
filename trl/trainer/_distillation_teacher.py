@@ -1,0 +1,727 @@
+# Copyright 2020-2026 The HuggingFace Team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Teacher registry, scoring executor and window store for managed multi-teacher distillation.
+
+Private helpers of [`DistillationTrainer`]: the registry resolves routing IDs to immutable teacher sources, the
+executor keeps one reloadable CPU body slot and scores the exact generated tokens through
+`torch.func.functional_call`, and the window store owns the CPU hidden-target blocks the managed loss consumes.
+See `/data/workspaces/mopd/implementation/interfaces.md` for the seam contract.
+"""
+
+import contextlib
+import hashlib
+import json
+import logging
+import os
+import struct
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import torch
+from accelerate.utils import is_peft_model
+from transformers import AutoConfig, AutoTokenizer, PreTrainedModel
+
+from ._distillation_heads import HeadIdentity, HeadSource, TargetGroup
+from .utils import create_model_from_path
+
+
+logger = logging.getLogger(__name__)
+
+# Loading options that change placement or numerics in ways the managed scoring path does not support: the executor
+# needs a plain, complete, dense CPU source it can substitute into `functional_call`.
+_UNSUPPORTED_INIT_KWARGS = ("device_map", "quantization_config", "load_in_8bit", "load_in_4bit")
+# Loading metadata copied into the manifest. Everything else (credentials in particular) is dropped.
+_MANIFEST_LOADING_KEYS = ("dtype", "revision", "attn_implementation", "low_cpu_mem_usage", "trust_remote_code")
+# Version of the scoring adapter (backbone `functional_call` + causal shift). Bump when its output changes.
+_ADAPTER_VERSION = 1
+# Version of the head transformations (linear projection, optional bias, logit scale, softcap).
+_TRANSFORM_VERSION = 1
+# Per-block bookkeeping charged on top of the raw hidden bytes when planning a window.
+_TARGET_BLOCK_OVERHEAD_BYTES = 4096
+# Rows per staging tile fill. One tile is reused for every block; copies block until complete (`non_blocking=False`).
+_STAGING_ROWS = 256
+
+
+def _canonical_json(payload) -> str:
+    """Serialize `payload` with sorted keys and no whitespace so digests ignore cosmetic JSON formatting."""
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _sha256_json(payload) -> str:
+    return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+# TODO(W3 seam): switch to `_distillation_identity.tokenizer_fingerprint` once it lands; the payload here is already
+# the agreed one (canonical JSON of the fast tokenizer's full serialization plus special-token roles/IDs).
+def _tokenizer_fingerprint(tokenizer) -> str:
+    """
+    Fingerprint a fast tokenizer's complete serialization together with its special-token roles and IDs.
+
+    Args:
+        tokenizer ([`~transformers.PreTrainedTokenizerFast`]):
+            Tokenizer to fingerprint. Slow tokenizers have no canonical serialization and are rejected.
+
+    Returns:
+        `str`: hex sha256 digest over canonical JSON (sorted keys, no whitespace).
+    """
+    if not tokenizer.is_fast:
+        raise ValueError(
+            "Managed multi-teacher distillation fingerprints the fast tokenizer's serialization, but "
+            f"{type(tokenizer).__name__} is a slow tokenizer. Pass a fast tokenizer for the student and every teacher."
+        )
+    roles = {}
+    for role, value in tokenizer.special_tokens_map.items():
+        tokens = value if isinstance(value, list) else [value]
+        roles[role] = [[token, tokenizer.convert_tokens_to_ids(token)] for token in tokens]
+    payload = {"backend": json.loads(tokenizer.backend_tokenizer.to_str()), "special_tokens": roles}
+    return _sha256_json(payload)
+
+
+def _safetensors_header(path: Path) -> dict:
+    """Read one safetensors file's JSON header (8-byte little-endian length, then the header) without any weights."""
+    with path.open("rb") as handle:
+        length = struct.unpack("<Q", handle.read(8))[0]
+        return json.loads(handle.read(length))
+
+
+def _checkpoint_inventory(path: str) -> dict:
+    """
+    Inventory a local checkpoint directory from its safetensors headers, without materializing any weights.
+
+    The inventory is the content identity of a local source and the basis for its storage/transient accounting. It is
+    cheap and deterministic, but header-level: two checkpoints whose tensors differ in value only are distinguished by
+    their path or resolved revision, which are part of `source_key` as well.
+
+    Args:
+        path (`str`):
+            Local checkpoint directory.
+
+    Returns:
+        `dict` with keys:
+            - `tensors` (`dict[str, list]`):
+                Tensor name to `[dtype, shape]` as recorded in the file header.
+            - `files` (`list[list]`):
+                Per weight file `[name, size_bytes, header_digest]`, sorted by name.
+            - `config_digest` (`str`):
+                sha256 of `config.json`.
+            - `numel` (`int`):
+                Total number of checkpoint elements.
+            - `largest_file_bytes` (`int`):
+                Size of the largest weight file, used as the loading transient estimate.
+    """
+    root = Path(path)
+    config_path = root / "config.json"
+    if not config_path.is_file():
+        raise ValueError(f"Teacher checkpoint '{path}' has no config.json.")
+    weight_files = sorted(root.glob("*.safetensors"))
+    if not weight_files:
+        raise ValueError(
+            f"Teacher checkpoint '{path}' contains no safetensors weight file. Managed multi-teacher distillation "
+            "reloads teacher bodies from immutable safetensors snapshots; re-save the checkpoint with "
+            "`save_pretrained`."
+        )
+    tensors = {}
+    files = []
+    numel = 0
+    for weight_file in weight_files:
+        header = _safetensors_header(weight_file)
+        for name, spec in header.items():
+            if name == "__metadata__":
+                continue
+            tensors[name] = [spec["dtype"], list(spec["shape"])]
+            count = 1
+            for dim in spec["shape"]:
+                count *= dim
+            numel += count
+        files.append([weight_file.name, weight_file.stat().st_size, _sha256_json(header)])
+    return {
+        "tensors": tensors,
+        "files": files,
+        "config_digest": hashlib.sha256(config_path.read_bytes()).hexdigest(),
+        "numel": numel,
+        "largest_file_bytes": max(entry[1] for entry in files),
+    }
+
+
+def _resolve_hub_snapshot(repo_id: str, revision: str | None, token: str | bool | None = None) -> tuple[str, str]:
+    """
+    Resolve a Hub branch/tag/commit to an immutable commit hash and download that commit's files locally.
+
+    Pinning the snapshot up front is what makes CPU body reload independent of the network.
+
+    Args:
+        repo_id (`str`):
+            Hub model repository.
+        revision (`str`, *optional*):
+            Branch, tag or commit. `None` selects the repository's default branch.
+        token (`str` or `bool`, *optional*):
+            Token forwarded to `huggingface_hub`.
+
+    Returns:
+        `tuple[str, str]`: the local snapshot directory and the resolved commit hash.
+    """
+    from huggingface_hub import HfApi, snapshot_download
+
+    commit = HfApi(token=token).model_info(repo_id, revision=revision).sha
+    local_dir = snapshot_download(repo_id, revision=commit, token=token)
+    return local_dir, commit
+
+
+def _resolve_dtype(loading_kwargs: dict, config) -> torch.dtype:
+    """Resolve the dtype the CPU source materializes in, mirroring `create_model_from_path`'s dtype handling."""
+    dtype = loading_kwargs.get("dtype", "float32")
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    if dtype in ("auto", None):
+        return config.dtype if isinstance(config.dtype, torch.dtype) else torch.float32
+    if dtype in ("bfloat16", "float16", "float32"):
+        return getattr(torch, dtype)
+    raise ValueError(
+        "Invalid `dtype` passed for a teacher. Expected either 'auto' or a string representing a valid `torch.dtype` "
+        f"(e.g., 'float32'), but got {dtype}."
+    )
+
+
+def _dtype_bytes(dtype: torch.dtype) -> int:
+    return torch.empty((), dtype=dtype).element_size()
+
+
+def _logit_transforms(text_config) -> tuple[float, float | None]:
+    """Read the teacher's pre-softmax logit transformations, matching `DistillationTrainer._compute_loss`."""
+    # `logit_scale` is None on models that don't scale (e.g. MPT); read that as unscaled (1.0). A real 0.0 is kept
+    # as-is. Muse Glimmer applies the same pre-softcap multiplier under the name `output_multiplier`.
+    logit_scale = getattr(text_config, "logit_scale", None)
+    if logit_scale is None:
+        logit_scale = getattr(text_config, "output_multiplier", None)
+    logit_scale = 1.0 if logit_scale is None else logit_scale
+    return float(logit_scale), getattr(text_config, "final_logit_softcapping", None)
+
+
+def _teacher_backbone(model: PreTrainedModel):
+    """
+    Return the backbone producing hidden states, the same object `DistillationTrainer._get_last_hidden_state` runs.
+
+    `base_model` skips `lm_head`. Managed teachers are plain text decoders: PEFT wrappers and pre-5.0 VLM shells
+    (where `base_model is model`, so scoring would re-run `lm_head`) need their own adapter and are rejected here.
+    """
+    if is_peft_model(model):
+        raise ValueError(
+            "Managed multi-teacher distillation cannot score a PEFT-wrapped teacher: merge the adapter into the base "
+            "weights and register the merged checkpoint instead."
+        )
+    backbone = model.base_model
+    if backbone is model:
+        raise ValueError(
+            f"Teacher architecture {type(model).__name__} exposes no separate backbone (`base_model` is the model "
+            "itself), so scoring would re-run its output head. This architecture needs a dedicated teacher adapter."
+        )
+    return backbone
+
+
+@contextlib.contextmanager
+def _plain_loading_env():
+    """
+    Scope Accelerate's student-only RAM-efficient loading policy off while a teacher body loads.
+
+    `transformers.distributed.fsdp.is_fsdp_enabled()` is true when `ACCELERATE_USE_FSDP` and
+    `FSDP_CPU_RAM_EFFICIENT_LOADING` are both set under an initialized process group; `from_pretrained` then fills
+    every process that is not local rank zero with zeros and waits for the student's state synchronization. Each rank
+    needs its own complete teacher, so both variables are forced off for the duration of the load and restored on
+    exit. DeepSpeed ZeRO-3's `zero.Init` is not env-scoped and stays unsupported (rejected by the trainer).
+    """
+    overrides = {"ACCELERATE_USE_FSDP": "false", "FSDP_CPU_RAM_EFFICIENT_LOADING": "false"}
+    previous = {name: os.environ.get(name) for name in overrides}
+    os.environ.update(overrides)
+    try:
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+@dataclass
+class TeacherEntry:
+    """
+    Everything the trainer knows about one registered teacher, independent of any loaded model object.
+
+    `hidden_dtype` and `projection_dtype` are the scoring precision policy: the executor records them at construction
+    from its autocast setting and the source dtype, and hidden targets are stored in `hidden_dtype`.
+    """
+
+    teacher_id: str
+    index: int
+    source: str | None
+    resolved_revision: str | None
+    source_key: str
+    config_class: str
+    hidden_size: int
+    vocab_size: int
+    source_dtype: torch.dtype
+    hidden_dtype: torch.dtype
+    projection_dtype: torch.dtype
+    tokenizer_fingerprint: str
+    head_identity: HeadIdentity
+    storage_bytes: int
+    evictable: bool
+    adapter_version: int
+    load_path: str | None
+    loading_kwargs: dict
+    loading_transient_bytes: int
+
+    @property
+    def head_bytes(self) -> int:
+        """Bytes of the retained CPU head source (weight plus optional bias)."""
+        rows, columns = self.head_identity.weight_shape
+        item = _dtype_bytes(self.head_identity.source_dtype)
+        return rows * columns * item + (rows * item if self.head_identity.has_bias else 0)
+
+
+class TeacherRegistry:
+    """
+    Immutable identity and routing table for the registered teachers.
+
+    Routing IDs are user-facing names: several IDs may point at the same repository, and each ID's `revision` is
+    resolved once to a commit hash whose files are snapshotted locally, so two revisions of one repository are two
+    entries that never share a source, head or cache. Shared tokenization is a v1 requirement, so every teacher's
+    tokenizer fingerprint must equal the student's and every teacher's vocabulary size must equal the student's.
+
+    Args:
+        teacher_models (`dict[str, str` or [`~transformers.PreTrainedModel`]`]`):
+            Mapping from routing ID to a checkpoint path/Hub ID, or to a frozen CPU model owned by the caller.
+        student_tokenizer ([`~transformers.PreTrainedTokenizerFast`]):
+            The student's processing class; prompts are rendered once with it and scored as token IDs.
+        student_vocab_size (`int`):
+            The student's `config.get_text_config().vocab_size`.
+        common_init_kwargs (`dict`, *optional*):
+            Loading kwargs applied to every path/Hub source, before per-ID overrides.
+        per_teacher_init_kwargs (`dict[str, dict]`, *optional*):
+            Per-ID loading overrides, including `revision`. IDs must exist in `teacher_models`; preloaded models
+            accept none.
+        teacher_tokenizers (`dict[str, ~transformers.PreTrainedTokenizerFast]`, *optional*):
+            Tokenizers for sources whose tokenizer cannot be resolved from the checkpoint. Required for preloaded
+            models.
+        student_model ([`~transformers.PreTrainedModel`], *optional*):
+            Unwrapped student, used only to reject preloaded teachers that alias the student's parameter storage.
+        trust_remote_code (`bool`, *optional*, defaults to `False`):
+            Forwarded to config/tokenizer/model loading.
+    """
+
+    def __init__(
+        self,
+        teacher_models: dict[str, str | PreTrainedModel],
+        *,
+        student_tokenizer,
+        student_vocab_size: int,
+        common_init_kwargs: dict | None = None,
+        per_teacher_init_kwargs: dict[str, dict] | None = None,
+        teacher_tokenizers: dict | None = None,
+        student_model: PreTrainedModel | None = None,
+        trust_remote_code: bool = False,
+    ):
+        if not teacher_models:
+            raise ValueError(
+                "`teacher_models` is empty. Register at least one teacher, or use the singular `teacher_model` "
+                "argument for single-teacher distillation."
+            )
+        common_init_kwargs = dict(common_init_kwargs or {})
+        per_teacher_init_kwargs = {key: dict(value) for key, value in (per_teacher_init_kwargs or {}).items()}
+        teacher_tokenizers = dict(teacher_tokenizers or {})
+        unknown = sorted(set(per_teacher_init_kwargs) - set(teacher_models))
+        if unknown:
+            raise ValueError(
+                f"`teacher_model_init_kwargs_by_teacher` has entries for unknown teacher IDs {unknown}. Registered "
+                f"IDs are {sorted(teacher_models)}."
+            )
+        unknown = sorted(set(teacher_tokenizers) - set(teacher_models))
+        if unknown:
+            raise ValueError(f"`teacher_tokenizers` has entries for unknown teacher IDs {unknown}.")
+
+        self.student_tokenizer_fingerprint = _tokenizer_fingerprint(student_tokenizer)
+        self.student_vocab_size = student_vocab_size
+        self.trust_remote_code = trust_remote_code
+        self.entries: list[TeacherEntry] = []
+        self._by_id: dict[str, TeacherEntry] = {}
+        self._preloaded: dict[int, PreTrainedModel] = {}
+        student_storages = _parameter_storages(student_model) if student_model is not None else set()
+
+        for index, (teacher_id, source) in enumerate(teacher_models.items()):
+            overrides = per_teacher_init_kwargs.get(teacher_id, {})
+            if isinstance(source, PreTrainedModel):
+                if overrides:
+                    raise ValueError(
+                        f"Teacher '{teacher_id}' is a preloaded model, so it cannot take per-teacher loading "
+                        f"overrides {sorted(overrides)}. Register a checkpoint path to apply loading options."
+                    )
+                entry = self._register_preloaded(
+                    teacher_id, index, source, teacher_tokenizers.get(teacher_id), student_storages
+                )
+                self._preloaded[index] = source
+            else:
+                loading_kwargs = {**common_init_kwargs, **overrides}
+                entry = self._register_path(teacher_id, index, source, loading_kwargs, teacher_tokenizers)
+            self.entries.append(entry)
+            self._by_id[teacher_id] = entry
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    def __getitem__(self, teacher_id: str) -> TeacherEntry:
+        if teacher_id not in self._by_id:
+            raise ValueError(f"Unknown teacher ID {teacher_id!r}. Registered IDs are {sorted(self._by_id)}.")
+        return self._by_id[teacher_id]
+
+    @property
+    def teacher_ids(self) -> list[str]:
+        return [entry.teacher_id for entry in self.entries]
+
+    def preloaded_model(self, index: int) -> PreTrainedModel:
+        """Return the caller-owned model registered at `index`, or `None` for reloadable path/Hub sources."""
+        return self._preloaded.get(index)
+
+    def resolve_ids(self, teacher_ids: list[str | None]) -> list[int]:
+        """
+        Map per-row routing IDs to registry indices.
+
+        Args:
+            teacher_ids (`list[str` or `None]`):
+                One ID per row. `None` is allowed only when exactly one teacher is registered.
+
+        Returns:
+            `list[int]`: the matching registry indices.
+        """
+        indices = []
+        for teacher_id in teacher_ids:
+            if teacher_id is None:
+                if len(self.entries) != 1:
+                    raise ValueError(
+                        f"A row has no `teacher_id`, but {len(self.entries)} teachers are registered "
+                        f"({sorted(self._by_id)}). Every row needs a known `teacher_id` unless exactly one teacher "
+                        "is registered."
+                    )
+                indices.append(0)
+            else:
+                indices.append(self[teacher_id].index)
+        return indices
+
+    def identity_digest(self) -> str:
+        """Digest over every entry's identity fields, compared once across ranks by the trainer."""
+        payload = [
+            {
+                "teacher_id": entry.teacher_id,
+                "index": entry.index,
+                "source": entry.source,
+                "resolved_revision": entry.resolved_revision,
+                "source_key": entry.source_key,
+                "config_class": entry.config_class,
+                "hidden_size": entry.hidden_size,
+                "vocab_size": entry.vocab_size,
+                "source_dtype": str(entry.source_dtype),
+                "hidden_dtype": str(entry.hidden_dtype),
+                "projection_dtype": str(entry.projection_dtype),
+                "tokenizer_fingerprint": entry.tokenizer_fingerprint,
+                "weight_shape": list(entry.head_identity.weight_shape),
+                "has_bias": entry.head_identity.has_bias,
+                "logit_scale": entry.head_identity.logit_scale,
+                "final_logit_softcapping": entry.head_identity.final_logit_softcapping,
+                "transform_version": entry.head_identity.transform_version,
+                "adapter_version": entry.adapter_version,
+            }
+            for entry in self.entries
+        ]
+        return _sha256_json({"student_tokenizer": self.student_tokenizer_fingerprint, "teachers": payload})
+
+    def manifest(self) -> dict:
+        """
+        Allowlisted registry description for `teacher_manifest.json`; never contains tokens or credentials.
+
+        Returns:
+            `dict` with keys:
+                - `version` (`int`):
+                    Manifest schema version.
+                - `identity_digest` (`str`):
+                    Value of [`~TeacherRegistry.identity_digest`].
+                - `student_tokenizer_fingerprint` (`str`):
+                    Fingerprint every teacher tokenizer had to match.
+                - `teachers` (`list[dict]`):
+                    Per teacher: `id`, `index`, `source`, `resolved_revision`, `source_key`,
+                    `tokenizer_fingerprint`, `config_class`, `hidden_size`, `vocab_size`, `source_dtype`,
+                    `hidden_dtype`, `projection_dtype`, `weight_shape`, `has_bias`, `logit_scale`,
+                    `final_logit_softcapping`, `transform_version`, `adapter_version`, `evictable`,
+                    `storage_bytes` and the allowlisted `loading` kwargs.
+        """
+        teachers = []
+        for entry in self.entries:
+            loading = {
+                key: str(entry.loading_kwargs[key]) for key in _MANIFEST_LOADING_KEYS if key in entry.loading_kwargs
+            }
+            teachers.append(
+                {
+                    "id": entry.teacher_id,
+                    "index": entry.index,
+                    "source": entry.source,
+                    "resolved_revision": entry.resolved_revision,
+                    "source_key": entry.source_key,
+                    "tokenizer_fingerprint": entry.tokenizer_fingerprint,
+                    "config_class": entry.config_class,
+                    "hidden_size": entry.hidden_size,
+                    "vocab_size": entry.vocab_size,
+                    "source_dtype": str(entry.source_dtype),
+                    "hidden_dtype": str(entry.hidden_dtype),
+                    "projection_dtype": str(entry.projection_dtype),
+                    "weight_shape": list(entry.head_identity.weight_shape),
+                    "has_bias": entry.head_identity.has_bias,
+                    "logit_scale": entry.head_identity.logit_scale,
+                    "final_logit_softcapping": entry.head_identity.final_logit_softcapping,
+                    "transform_version": entry.head_identity.transform_version,
+                    "adapter_version": entry.adapter_version,
+                    "evictable": entry.evictable,
+                    "storage_bytes": entry.storage_bytes,
+                    "loading": loading,
+                }
+            )
+        return {
+            "version": 1,
+            "identity_digest": self.identity_digest(),
+            "student_tokenizer_fingerprint": self.student_tokenizer_fingerprint,
+            "teachers": teachers,
+        }
+
+    def _register_path(
+        self, teacher_id: str, index: int, source: str, loading_kwargs: dict, teacher_tokenizers: dict
+    ) -> TeacherEntry:
+        unsupported = sorted(key for key in _UNSUPPORTED_INIT_KWARGS if key in loading_kwargs)
+        if unsupported:
+            raise ValueError(
+                f"Teacher '{teacher_id}' passes unsupported loading options {unsupported}. Managed teachers are "
+                "loaded as plain dense CPU models: placement and quantization options are not supported."
+            )
+        revision = loading_kwargs.get("revision")
+        if Path(source).is_dir():
+            if revision is not None:
+                raise ValueError(
+                    f"Teacher '{teacher_id}' points at the local checkpoint '{source}' and also passes "
+                    f"revision={revision!r}. Local paths carry no revision; register the two checkpoints under "
+                    "separate teacher IDs instead."
+                )
+            load_path, resolved_revision = source, None
+        else:
+            load_path, resolved_revision = _resolve_hub_snapshot(
+                source, revision, loading_kwargs.get("token", loading_kwargs.get("use_auth_token"))
+            )
+        inventory = _checkpoint_inventory(load_path)
+        config = AutoConfig.from_pretrained(load_path, trust_remote_code=self.trust_remote_code)
+        text_config = config.get_text_config()
+        source_dtype = _resolve_dtype(loading_kwargs, text_config)
+        head_shape = inventory["tensors"].get("lm_head.weight")
+        weight_shape = (
+            (head_shape[1][0], head_shape[1][1])
+            if head_shape is not None
+            else (text_config.vocab_size, text_config.hidden_size)
+        )
+        has_bias = "lm_head.bias" in inventory["tensors"]
+        source_key = _sha256_json(
+            {
+                "kind": "path" if resolved_revision is None else "hub",
+                "source": source,
+                "revision": resolved_revision,
+                "content": {
+                    "config": inventory["config_digest"],
+                    "files": inventory["files"],
+                    "tensors": inventory["tensors"],
+                },
+                "loading": _loading_identity(loading_kwargs, source_dtype),
+                "adapter_version": _ADAPTER_VERSION,
+                "transform_version": _TRANSFORM_VERSION,
+            }
+        )
+        tokenizer = teacher_tokenizers.get(teacher_id)
+        if tokenizer is None:
+            tokenizer = AutoTokenizer.from_pretrained(load_path, trust_remote_code=self.trust_remote_code)
+        return self._build_entry(
+            teacher_id=teacher_id,
+            index=index,
+            source=source,
+            resolved_revision=resolved_revision,
+            source_key=source_key,
+            text_config=text_config,
+            config_class=type(config).__name__,
+            source_dtype=source_dtype,
+            weight_shape=weight_shape,
+            has_bias=has_bias,
+            tokenizer=tokenizer,
+            storage_bytes=inventory["numel"] * _dtype_bytes(source_dtype),
+            evictable=True,
+            load_path=load_path,
+            loading_kwargs=loading_kwargs,
+            loading_transient_bytes=inventory["largest_file_bytes"],
+        )
+
+    def _register_preloaded(
+        self, teacher_id: str, index: int, model: PreTrainedModel, tokenizer, student_storages: set[int]
+    ) -> TeacherEntry:
+        _teacher_backbone(model)
+        devices = {tensor.device.type for tensor in model.parameters()}
+        if devices != {"cpu"}:
+            raise ValueError(
+                f"Preloaded teacher '{teacher_id}' has parameters on {sorted(devices)}. Preloaded teachers must be "
+                "frozen CPU sources; the executor uploads disposable copies for scoring."
+            )
+        if tokenizer is None:
+            raise ValueError(
+                f"Preloaded teacher '{teacher_id}' needs its tokenizer in `teacher_tokenizers`: shared tokenization "
+                "is validated by fingerprint and cannot be resolved from a model object."
+            )
+        aliased = sorted(
+            name
+            for name, tensor in list(model.named_parameters()) + list(model.named_buffers())
+            if tensor.untyped_storage().data_ptr() in student_storages
+        )
+        if aliased:
+            raise ValueError(
+                f"Preloaded teacher '{teacher_id}' shares storage with the student for {aliased}. Teachers are frozen "
+                "targets and must be independent of the student's parameters; pass a separate copy."
+            )
+        head = model.get_output_embeddings()
+        config = model.config
+        text_config = config.get_text_config()
+        source_key = _sha256_json(
+            {
+                "kind": "preloaded",
+                # A caller model has no immutable file identity, so the routing ID pins it: a preloaded source is
+                # never shared between two entries.
+                "teacher_id": teacher_id,
+                "config": json.loads(config.to_json_string(use_diff=False)),
+                "parameters": sorted(
+                    [name, str(tensor.dtype), list(tensor.shape)] for name, tensor in model.named_parameters()
+                ),
+                "adapter_version": _ADAPTER_VERSION,
+                "transform_version": _TRANSFORM_VERSION,
+            }
+        )
+        return self._build_entry(
+            teacher_id=teacher_id,
+            index=index,
+            source=None,
+            resolved_revision=None,
+            source_key=source_key,
+            text_config=text_config,
+            config_class=type(config).__name__,
+            source_dtype=head.weight.dtype,
+            weight_shape=(head.weight.shape[0], head.weight.shape[1]),
+            has_bias=head.bias is not None,
+            tokenizer=tokenizer,
+            storage_bytes=sum(
+                storage.nbytes()
+                for storage in {
+                    tensor.untyped_storage().data_ptr(): tensor.untyped_storage()
+                    for tensor in list(model.parameters()) + list(model.buffers())
+                }.values()
+            ),
+            evictable=False,
+            load_path=None,
+            loading_kwargs={},
+            loading_transient_bytes=0,
+        )
+
+    def _build_entry(
+        self,
+        *,
+        teacher_id,
+        index,
+        source,
+        resolved_revision,
+        source_key,
+        text_config,
+        config_class,
+        source_dtype,
+        weight_shape,
+        has_bias,
+        tokenizer,
+        storage_bytes,
+        evictable,
+        load_path,
+        loading_kwargs,
+        loading_transient_bytes,
+    ) -> TeacherEntry:
+        if text_config.vocab_size != self.student_vocab_size:
+            raise ValueError(
+                f"Teacher '{teacher_id}' has vocab_size {text_config.vocab_size} but the student has vocab_size "
+                f"{self.student_vocab_size}. Distillation compares full next-token distributions, which requires a "
+                "shared vocabulary."
+            )
+        if weight_shape[0] != text_config.vocab_size:
+            raise ValueError(
+                f"Teacher '{teacher_id}' has an output head with {weight_shape[0]} rows but vocab_size "
+                f"{text_config.vocab_size}. Managed distillation projects targets through the teacher's own head and "
+                "cannot reconcile a padded head."
+            )
+        fingerprint = _tokenizer_fingerprint(tokenizer)
+        if fingerprint != self.student_tokenizer_fingerprint:
+            raise ValueError(
+                f"Teacher '{teacher_id}' has tokenizer fingerprint {fingerprint[:12]}... but the student's is "
+                f"{self.student_tokenizer_fingerprint[:12]}.... Managed multi-teacher distillation renders prompts "
+                "once with the student's processing class and scores those exact token IDs, so the tokenizer "
+                "serialization and special-token roles/IDs must be identical."
+            )
+        logit_scale, softcapping = _logit_transforms(text_config)
+        head_identity = HeadIdentity(
+            teacher_id=teacher_id,
+            source_key=source_key,
+            weight_shape=weight_shape,
+            has_bias=has_bias,
+            source_dtype=source_dtype,
+            logit_scale=logit_scale,
+            final_logit_softcapping=softcapping,
+            transform_version=_TRANSFORM_VERSION,
+        )
+        return TeacherEntry(
+            teacher_id=teacher_id,
+            index=index,
+            source=source,
+            resolved_revision=resolved_revision,
+            source_key=source_key,
+            config_class=config_class,
+            hidden_size=weight_shape[1],
+            vocab_size=text_config.vocab_size,
+            source_dtype=source_dtype,
+            hidden_dtype=source_dtype,
+            projection_dtype=source_dtype,
+            tokenizer_fingerprint=fingerprint,
+            head_identity=head_identity,
+            storage_bytes=storage_bytes,
+            evictable=evictable,
+            adapter_version=_ADAPTER_VERSION,
+            load_path=load_path,
+            loading_kwargs=loading_kwargs,
+            loading_transient_bytes=loading_transient_bytes,
+        )
+
+
+def _parameter_storages(model: PreTrainedModel) -> set[int]:
+    """Data pointers of every storage `model`'s parameters and buffers own, used for alias rejection."""
+    return {tensor.untyped_storage().data_ptr() for tensor in list(model.parameters()) + list(model.buffers())}
+
+
+def _loading_identity(loading_kwargs: dict, source_dtype: torch.dtype) -> dict:
+    """Effective loading/precision settings that belong to the source identity, with credentials removed."""
+    secrets = ("token", "use_auth_token", "hf_token")
+    settings = {key: str(value) for key, value in loading_kwargs.items() if key not in secrets}
+    settings["dtype"] = str(source_dtype)
+    settings.pop("revision", None)
+    return settings
