@@ -94,9 +94,12 @@ def _teacher_checkpoint(path: str, scale: float | None = None) -> str:
 
 
 @pytest.mark.slow
-@pytest.mark.skipif(not _torchrun_available(), reason="torchrun cannot start two gloo processes here")
 class TestManagedDistillationTwoRankCpu(TrlTestCase):
     def test_two_rank_update_matches_a_single_process_reference(self):
+        # Probed here rather than in a `skipif`, which would spawn two processes during *collection* of any run that
+        # touches this file. A skip is a skip: it is never reported as a pass.
+        if not _torchrun_available():
+            pytest.skip("torchrun cannot start two gloo processes here")
         teacher_a = _teacher_checkpoint(os.path.join(self.tmp_dir, "teacher-a"))
         teacher_b = _teacher_checkpoint(os.path.join(self.tmp_dir, "teacher-b"), scale=1.05)
         environment = dict(

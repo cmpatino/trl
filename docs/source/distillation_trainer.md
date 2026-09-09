@@ -125,6 +125,12 @@ trainer = DistillationTrainer(
 evaluation row needs a `teacher_id` column naming one of the mapping's keys; the single-teacher trainer keeps its
 current behavior, where an absent `teacher_id` column selects that one teacher.
 
+Pass `teacher_tokenizers` for entries whose tokenizer cannot be resolved from the checkpoint itself; it is required
+for an already-loaded model, since a model object carries no verifiable tokenizer. `close_teachers()` releases every
+teacher resource (loaded body, device head slot, staging tiles, retained head sources) and is useful in notebooks; it
+is idempotent, refuses to run while a loss still owns targets, keeps the registry metadata, and the next `train()` or
+`evaluate()` reloads on demand from the pinned local snapshots.
+
 Teacher IDs are routing names, not repository names: two IDs can point at different revisions of the same
 repository. `teacher_model_init_kwargs_by_teacher` sets per-ID loading overrides, applied after the common
 `teacher_model_init_kwargs`, most commonly a `revision`:
@@ -180,16 +186,19 @@ implies sharded teachers, and teachers stay plain, unsharded Transformers infere
 describes compatibility with this managed lifecycle specifically, not general Transformers or single-teacher
 `DistillationTrainer` capability:
 
-| Mode | Status |
-| --- | --- |
-| Single GPU/DDP | First validation target |
-| ZeRO-1/2 (student) | Validation in progress, not yet supported |
-| FSDP2 (student) | Validation in progress, not yet supported |
-| FSDP1, ZeRO-3, tensor/pipeline/context parallelism, sharded teachers | Not supported |
-| Quantized teachers | Not supported |
+| Mode | Status | Evidence |
+| --- | --- | --- |
+| Single device | Validation in progress, not yet supported | CPU: managed-vs-legacy update parity (bit-identical losses and parameters), window/accumulation, evaluation, resume, cleanup |
+| DDP | Validation in progress, not yet supported | CPU (gloo, two ranks): disjoint per-rank teachers, exact metric reduction, update matches a single-process reference to 3.7e-9. No device-memory evidence |
+| ZeRO-1/2 (student) | Validation in progress, not yet supported | Accepted by the trainer so it can be run; no run has happened |
+| FSDP2 (student) | Validation in progress, not yet supported | Accepted by the trainer so it can be run; no run has happened |
+| FSDP1, ZeRO-3, tensor/context/sequence parallelism, sharded teachers | Not supported | Rejected at initialization, naming the missing adapter |
+| Quantized or device-mapped teachers, VLM students | Not supported | Rejected at initialization, naming the missing adapter |
 
 A mode not listed as supported should be assumed unsupported even if it happens to run without an explicit error;
-only stages with landed evidence get promoted in this table.
+only stages with landed evidence get promoted in this table. Nothing in this table has GPU evidence: every result
+above was produced on CPU, so the one-teacher-head and one-teacher-body *device* memory bounds are designed and
+instrumented but not measured.
 
 ## Customization
 

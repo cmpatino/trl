@@ -438,6 +438,89 @@ class TestManagedEvaluation(TrlTestCase):
         assert trainer._teacher_store.live_keys == []
         assert trainer._teacher_head_cache.stats.live_head_bytes == 0
 
+    def test_nested_evaluation_mid_accumulation_drops_and_rescores_the_training_window(self, teachers):
+        # Item 6, the nested-evaluation policy: an evaluation that starts while a training scoring window is still
+        # partly unconsumed must hand the target budget over, keep the buffered tokens and the consumption position,
+        # and let the next training microbatch rescore what is left. `Trainer` only evaluates at optimizer-step
+        # boundaries, where the window is always fully consumed, so the callback evaluates on a *substep* end.
+        observations = []
+
+        class EvaluatingCallback(TrainerCallback):
+            def on_substep_end(self, args, state, control, **kwargs):
+                trainer = self.trainer
+                observations.append(
+                    {
+                        "when": "before_eval",
+                        "live": list(trainer._teacher_store.live_keys),
+                        "window": sorted(trainer._teacher_window),
+                        "step": trainer._step,
+                        "buffered": [id(batch["completion_ids"]) for batch in trainer._buffered_inputs],
+                    }
+                )
+                trainer.evaluate()
+                observations.append(
+                    {
+                        "when": "after_eval",
+                        "live": list(trainer._teacher_store.live_keys),
+                        "window": sorted(trainer._teacher_window),
+                        "step": trainer._step,
+                        "buffered": [id(batch["completion_ids"]) for batch in trainer._buffered_inputs],
+                    }
+                )
+
+        callback = EvaluatingCallback()
+        training_args = DistillationConfig(
+            output_dir=self.tmp_dir,
+            learning_rate=0.1,
+            per_device_train_batch_size=1,
+            per_device_eval_batch_size=1,
+            gradient_accumulation_steps=2,
+            max_completion_length=4,
+            max_steps=2,
+            logging_steps=1,
+            report_to="none",
+        )
+        trainer = DistillationTrainer(
+            model=MODEL_ID,
+            args=training_args,
+            train_dataset=_routed_dataset(["a", "b"] * 6),
+            eval_dataset=_routed_dataset(["a", "b"]),
+            teacher_models=teachers,
+            callbacks=[callback],
+        )
+        callback.trainer = trainer
+        plans = []
+        plan_window = trainer._teacher_store.plan_window
+
+        def counting_plan_window(*args, **kwargs):
+            plan = plan_window(*args, **kwargs)
+            plans.append(plan)
+            return plan
+
+        trainer._teacher_store.plan_window = counting_plan_window
+        previous_params = {name: param.clone() for name, param in trainer.model.named_parameters()}
+
+        trainer.train()
+
+        assert observations, "the callback never ran on a substep end"
+        before = observations[0]
+        after = observations[1]
+        # The window really was partly unconsumed when the evaluation started, and the evaluation dropped it.
+        assert before["window"], "nothing was scored when the nested evaluation started"
+        assert after["window"] == [] and after["live"] == []
+        # Buffered tokens and the training consumption position survive the evaluation untouched.
+        assert after["buffered"] == before["buffered"]
+        assert after["step"] == before["step"]
+        # The dropped microbatch was rescored: the same training generation batch was planned more than once.
+        training_plans = [plan for plan in plans if plan.generation_id > 0]
+        rescored = [plan for plan in training_plans if plan.microbatch_indices and plan.microbatch_indices[0] > 0]
+        assert rescored, f"the remaining window was never rescored; plans: {[p.microbatch_indices for p in plans]}"
+        # And training still completed and moved the student.
+        assert trainer.state.log_history[-1]["train_loss"] is not None
+        for name, param in previous_params.items():
+            assert not torch.equal(param, trainer.model.get_parameter(name)), f"Parameter {name} has not changed."
+        assert trainer._teacher_store.live_keys == []
+
     def test_evaluation_batch_that_does_not_fit_the_budget_raises(self, teachers):
         training_args = DistillationConfig(
             output_dir=self.tmp_dir,
