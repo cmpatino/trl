@@ -25,6 +25,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenize
 from transformers.testing_utils import torch_device
 
 from trl.trainer import _distillation_teacher as teacher_module
+from trl.trainer._distillation_heads import TeacherHeadCache
 from trl.trainer._distillation_identity import TeacherManifest, tokenizer_fingerprint
 from trl.trainer._distillation_teacher import (
     HiddenTargetBlock,
@@ -932,6 +933,28 @@ class TestWindowStore:
         }
         with pytest.raises(ValueError, match="has no rows"):
             store.plan_window([empty], target_cache_bytes=1 << 20)
+
+
+class TestRealHeadCacheSeam:
+    """One test wiring W1's real `TeacherHeadCache` instead of the fake, to check the retention seam end to end."""
+
+    def test_retained_source_projects_through_a_real_lease(self, sources, tokenizer):
+        registry = make_registry({"early": sources["a"]}, tokenizer)
+        cache = TeacherHeadCache(torch.device("cpu"))
+        executor = TeacherExecutor(registry, cache, torch.device("cpu"), scoring_batch_size=1)
+        microbatch = make_microbatch([0])
+        block, positions, _ = score_single(executor, registry, microbatch)
+        identity = registry["early"].head_identity
+        executor.retain_head_source(0)
+        with cache.projection_lease(identity, torch.float32) as head:
+            logits = block.hidden @ head.weight.t()
+        _, reference_logits = reference_forward(sources["a"], microbatch)
+        torch.testing.assert_close(logits, reference_logits[positions], rtol=1e-5, atol=1e-6)
+        assert cache.stats.uploads == 1
+        cache.evict_idle_gpu()
+        executor.release_head_source(0)
+        executor.close()
+        cache.close()
 
 
 class TestSourceContentIdentity:
