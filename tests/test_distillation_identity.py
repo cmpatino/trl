@@ -227,6 +227,34 @@ class TestTeacherManifest(TrlTestCase):
         manifest = _build_manifest()
         manifest.check_compatible(_build_manifest())  # must not raise
 
+    def test_check_compatible_ignores_differing_source_path(self):
+        # `source` is display/reload metadata (e.g. a local checkpoint path); the same teacher content restaged at
+        # a different path on resume must still compare compatible, since `source_key` already carries the
+        # resolved, path-free content identity.
+        manifest = _build_manifest()
+        other_registry = _registry_manifest()
+        other_registry["teachers"][0]["source"] = "/different/staged/path/for/early"
+        other_registry["teachers"][1]["source"] = "/different/staged/path/for/late"
+        other = TeacherManifest.from_registry(
+            other_registry, student_tokenizer_fingerprint="student-fp", beta=1.0, temperature=1.0, chunk_size=256
+        )
+
+        manifest.check_compatible(other)  # must not raise
+
+    def test_check_compatible_rejects_differing_source_key_with_equal_source(self):
+        # An equal `source` (e.g. the same repo path) must not mask a different `source_key`: two revisions of the
+        # same repository staged at the same local path have different content identity.
+        manifest = _build_manifest()
+        other_registry = _registry_manifest()
+        assert other_registry["teachers"][0]["source"] == _registry_manifest()["teachers"][0]["source"]
+        other_registry["teachers"][0]["source_key"] = "org/teacher@commit-a-CHANGED"
+        other = TeacherManifest.from_registry(
+            other_registry, student_tokenizer_fingerprint="student-fp", beta=1.0, temperature=1.0, chunk_size=256
+        )
+
+        with pytest.raises(ValueError, match=r"early.*source_key"):
+            manifest.check_compatible(other)
+
     def test_check_compatible_rejects_reordered_teacher_ids(self):
         manifest = _build_manifest()
         other_registry = _registry_manifest()

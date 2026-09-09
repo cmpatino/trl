@@ -115,6 +115,11 @@ _TEACHER_ENTRY_KEYS = (
 )
 _TEACHER_DTYPE_KEYS = ("source_dtype", "hidden_dtype", "projection_dtype")
 _HEAD_IDENTITY_KEYS = ("weight_shape", "has_bias", "logit_scale", "final_logit_softcapping", "transform_version")
+# Per-teacher keys `check_compatible` treats as identity, i.e. a difference is fatal. Excludes `source`: it is
+# display/reload metadata (e.g. a local checkpoint path), not identity. `source_key` already carries the resolved,
+# path-free content identity (e.g. a content hash for local sources), so the same teacher staged at a different
+# path must still compare compatible.
+_TEACHER_COMPARED_KEYS = ("resolved_revision", "source_key", "tokenizer_fingerprint", "adapter_version")
 
 
 @dataclass
@@ -256,7 +261,9 @@ class TeacherManifest:
         Raises:
             `ValueError`: Listing every differing field, if `self` and `other` disagree on teacher IDs/order, source
                 keys, resolved revisions, tokenizer fingerprints, head identity fields, dtypes, beta, temperature, or
-                chunk size.
+                chunk size. Each teacher's `source` (e.g. a local checkpoint path) is informational only and is
+                never compared: it can legitimately differ across a resume (the same content restaged at a
+                different path) without affecting the teacher's identity, which `source_key` already captures.
         """
         differences = []
 
@@ -265,7 +272,7 @@ class TeacherManifest:
         if self_ids != other_ids:
             differences.append(f"teacher ids/order: {self_ids!r} != {other_ids!r}")
         else:
-            per_teacher_keys = _TEACHER_ENTRY_KEYS[2:] + _TEACHER_DTYPE_KEYS  # skip id/index, already compared above
+            per_teacher_keys = _TEACHER_COMPARED_KEYS + _TEACHER_DTYPE_KEYS
             for self_teacher, other_teacher in zip(self.teachers, other.teachers, strict=True):
                 for key in per_teacher_keys:
                     if self_teacher[key] != other_teacher[key]:
