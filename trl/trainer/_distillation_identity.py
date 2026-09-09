@@ -37,13 +37,17 @@ def canonical_tokenizer_payload(tokenizer) -> dict:
             Tokenizer to canonicalize. Must be a fast (Rust-backed) tokenizer.
 
     Returns:
-        `dict`: The parsed complete fast-tokenizer serialization (vocabulary, merges, added tokens, normalizer,
-        pre-tokenizer, post-processor, decoder) with two additional top-level keys: `special_tokens`, mapping each
-        special-token role to its `(token string, token id)` pair, and `model_input_names`. `model_input_names` is
-        included because it changes which tensors the tokenizer produces from the same token IDs (e.g. whether
+        `dict`: The parsed fast-tokenizer serialization (vocabulary, merges, added tokens, normalizer, pre-tokenizer,
+        post-processor, decoder) with two additional top-level keys: `special_tokens`, mapping each special-token
+        role to its `(token string, token id)` pair, and `model_input_names`. `model_input_names` is included
+        because it changes which tensors the tokenizer produces from the same token IDs (e.g. whether
         `token_type_ids` are rendered), which changes what the student/teacher actually consume; `padding_side` and
         `truncation_side` are excluded because they only affect batch layout around already-decided token IDs, not
-        the IDs themselves.
+        the IDs themselves. The serialization's own `padding`/`truncation` sections are dropped for the same
+        reason, and additionally because they are transient call-time state rather than identity: a fast
+        tokenizer's backend records the strategy from the *last* call that used padding/truncation (e.g.
+        `tokenizer(..., padding=True)`), so hashing them would make the fingerprint depend on incidental prior use
+        of the tokenizer instead of only on what it renders a prompt's token IDs to.
 
     Raises:
         `TypeError`: If `tokenizer` is not a fast tokenizer. Slow tokenizers need a dedicated validator; none exists
@@ -56,6 +60,10 @@ def canonical_tokenizer_payload(tokenizer) -> dict:
         )
 
     payload = json.loads(tokenizer.backend_tokenizer.to_str())
+    # Backend call-time state, not tokenizer identity: mutated in place by ordinary padded/truncated calls (e.g.
+    # `tokenizer(..., padding=True)`), so keeping them would make the fingerprint depend on prior tokenizer use.
+    payload.pop("padding", None)
+    payload.pop("truncation", None)
     # `extra_special_tokens`/`extra_special_tokens_ids` is the transformers name for what the design calls
     # "additional_special_tokens"; keep the payload key name stable across transformers versions.
     payload["special_tokens"] = {
