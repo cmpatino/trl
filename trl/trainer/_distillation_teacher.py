@@ -725,3 +725,479 @@ def _loading_identity(loading_kwargs: dict, source_dtype: torch.dtype) -> dict:
     settings["dtype"] = str(source_dtype)
     settings.pop("revision", None)
     return settings
+
+
+@dataclass
+class HiddenTargetBlock:
+    """
+    One contiguous CPU allocation of hidden targets, shared by every group of the same width and dtype in a window.
+
+    Groups take zero-copy row slices of `hidden`; `row_samples` records the `(sample_id, completion_position)` each row
+    was scored for, so consumption never relies on row order alone.
+    """
+
+    block_id: int
+    hidden: torch.Tensor
+    row_samples: list[tuple]
+
+    @property
+    def nbytes(self) -> int:
+        return self.hidden.numel() * self.hidden.element_size()
+
+
+class TargetWriter:
+    """
+    Bounded writer copying scored device rows into reserved rows of a CPU [`HiddenTargetBlock`].
+
+    Copies go through the executor's staging tile in `_STAGING_ROWS`-row pieces and block until complete
+    (`non_blocking=False`), so a tile is never rewritten before its copy finishes and the block never needs a second
+    full host copy. The tile carries the block's dtype, so it also performs the hidden-dtype cast.
+
+    Args:
+        block ([`HiddenTargetBlock`]):
+            Destination block.
+        rows (`torch.Tensor`):
+            CPU int64 destination row indices, aligned with the request's `positions`.
+        staging (`torch.Tensor`):
+            Reused staging tile, `(tile_rows, H)` in the block's dtype.
+    """
+
+    def __init__(self, block: HiddenTargetBlock, rows: torch.Tensor, staging: torch.Tensor):
+        self.block = block
+        self.rows = rows
+        self.staging = staging
+        self.rows_written = 0
+
+    def write(self, offset: int, hidden: torch.Tensor) -> None:
+        """
+        Copy `hidden` into the rows reserved at `offset`.
+
+        Args:
+            offset (`int`):
+                Index into `rows` the first copied row belongs to.
+            hidden (`torch.Tensor`):
+                Scored rows `(n, H)` on the scoring device, in `rows[offset : offset + n]` order.
+        """
+        count = hidden.shape[0]
+        if offset + count > self.rows.numel():
+            raise RuntimeError(
+                f"teacher scoring wrote {offset + count} rows into a block slice reserved for {self.rows.numel()}"
+            )
+        tile_rows = self.staging.shape[0]
+        for start in range(0, count, tile_rows):
+            piece = hidden[start : start + tile_rows]
+            staged = self.staging[: piece.shape[0]]
+            staged.copy_(piece, non_blocking=False)
+            self.block.hidden.index_copy_(0, self.rows[offset + start : offset + start + piece.shape[0]], staged)
+        self.rows_written += count
+
+
+@dataclass(frozen=True)
+class ScoreRequest:
+    """
+    One teacher's scoring request for one microbatch: exact tokens, alignment metadata and requested positions.
+
+    `input_ids`/`attention_mask` are the generation payload's `prompt_ids`/`completion_ids` (left-padded prompts,
+    right-padded completions) concatenated; `positions` are the flat `b * K + k` completion positions whose hidden
+    states become targets, in ascending order. Masked positions stay in the input context and simply are not requested.
+    """
+
+    generation_id: int
+    microbatch_index: int
+    teacher_index: int
+    input_ids: torch.Tensor
+    attention_mask: torch.Tensor
+    prompt_length: int
+    completion_length: int
+    positions: torch.Tensor
+    sample_ids: tuple
+    representation_version: int = 1
+
+
+@dataclass(frozen=True)
+class ScoreResult:
+    """Completed target metadata for one [`ScoreRequest`]."""
+
+    teacher_index: int
+    rows_written: int
+    hidden_dtype: torch.dtype
+    forward_calls: int
+
+
+@dataclass
+class ExecutorStats:
+    """Performance counters of the scoring executor; `device` counters are the disposable scoring copies."""
+
+    cpu_reloads: int = 0
+    disk_bytes: int = 0
+    backbone_uploads: int = 0
+    upload_bytes: int = 0
+    upload_seconds: float = 0.0
+    forward_calls: int = 0
+    rows_scored: int = 0
+    live_cpu_weight_bytes: int = 0
+    peak_cpu_weight_bytes: int = 0
+    live_device_weight_bytes: int = 0
+    peak_device_weight_bytes: int = 0
+    staging_bytes: int = 0
+
+
+class TeacherExecutor:
+    """
+    Loads teacher bodies, scores exact generated tokens and retains the exact CPU head sources.
+
+    One reloadable CPU body slot serves every path/Hub source: loading another source releases the current body's
+    module and parameter dictionaries, and the replacement is reloaded from the registry's pinned local snapshot, so
+    host residency depends on the largest teacher instead of the number registered. Caller-provided models are
+    borrowed, never evicted, and charged against the CPU budget for the executor's lifetime. Head sources are compact
+    CPU copies retained independently of the body, so a checkpointed loss replay can re-project a teacher whose body
+    is long gone without any disk or network work.
+
+    Scoring substitutes disposable device parameters/buffers into the backbone with `torch.func.functional_call`
+    (`tie_weights=True`, `strict=True`), under an explicit `torch.no_grad()` and the recorded autocast context, since
+    `_prepare_inputs` runs outside the student wrapper's precision context. The backbone is asked for full-length
+    outputs (never `logits_to_keep`), the output length is verified, and only then is the causal shift applied and the
+    requested completion positions selected — the same arithmetic as
+    `DistillationTrainer._get_last_hidden_state` followed by the loss mask.
+
+    Args:
+        registry ([`TeacherRegistry`]):
+            Registry whose entries this executor serves.
+        head_cache (`TeacherHeadCache`):
+            One-slot device head cache the retained head sources are registered with.
+        device (`torch.device`):
+            Device the scoring forward runs on.
+        cpu_weight_budget_bytes (`int`, *optional*):
+            Cap on retained head sources, non-evictable models, the body and its loading transient.
+        gpu_weight_budget_bytes (`int`, *optional*):
+            Cap on the disposable device weights of one scoring forward.
+        scoring_batch_size (`int`, *optional*, defaults to `1`):
+            Maximum rows per teacher forward.
+        autocast_dtype (`torch.dtype`, *optional*):
+            When set, scoring runs under `torch.autocast(device_type, dtype=autocast_dtype)` and targets are stored in
+            that dtype. When unset there is no autocast and targets are stored in the source dtype.
+        staging_rows (`int`, *optional*, defaults to `256`):
+            Rows per staging tile fill.
+    """
+
+    def __init__(
+        self,
+        registry: TeacherRegistry,
+        head_cache,
+        device: torch.device,
+        *,
+        cpu_weight_budget_bytes: int | None = None,
+        gpu_weight_budget_bytes: int | None = None,
+        scoring_batch_size: int = 1,
+        autocast_dtype: torch.dtype | None = None,
+        staging_rows: int = _STAGING_ROWS,
+    ):
+        self.registry = registry
+        self.head_cache = head_cache
+        self.device = torch.device(device)
+        self.cpu_weight_budget_bytes = cpu_weight_budget_bytes
+        self.gpu_weight_budget_bytes = gpu_weight_budget_bytes
+        self.scoring_batch_size = scoring_batch_size
+        self.autocast_dtype = autocast_dtype
+        self.staging_rows = staging_rows
+        self.capabilities = {"hidden_targets": True, "requires_collective_schedule": False}
+        self.stats = ExecutorStats()
+        # Recorded precision policy: hidden targets are stored in `hidden_dtype`, and `projection_dtype` is the matmul
+        # execution dtype the managed loss must reproduce on replay.
+        for entry in registry.entries:
+            entry.hidden_dtype = autocast_dtype or entry.source_dtype
+            entry.projection_dtype = autocast_dtype or entry.source_dtype
+        self._body: PreTrainedModel | None = None
+        self._body_key: str | None = None
+        self._loaded_keys: set[str] = set()
+        self._head_sources: dict[int, HeadSource] = {}
+        self._head_refcounts: dict[int, int] = {}
+        self._staging: torch.Tensor | None = None
+        self._closed = False
+        self._non_evictable_bytes = sum(entry.storage_bytes for entry in registry.entries if not entry.evictable)
+        self._account_cpu()
+
+    def retain_head_source(self, index: int) -> HeadSource:
+        """
+        Retain the exact CPU head of teacher `index`, registering it with the head cache on first use.
+
+        Args:
+            index (`int`):
+                Registry index.
+
+        Returns:
+            [`HeadSource`]: the retained CPU head, valid until the matching number of
+            [`~TeacherExecutor.release_head_source`] calls.
+        """
+        self._check_open()
+        if index not in self._head_sources:
+            self._head_sources[index] = self._build_head_source(self.registry.entries[index])
+            self.head_cache.retain_head_source(self._head_sources[index])
+            self._account_cpu()
+        self._head_refcounts[index] = self._head_refcounts.get(index, 0) + 1
+        return self._head_sources[index]
+
+    def release_head_source(self, index: int) -> None:
+        """Drop one retention of teacher `index`'s head source, unregistering it when the last one goes away."""
+        count = self._head_refcounts.get(index, 0)
+        if count == 0:
+            raise RuntimeError(f"head source for teacher index {index} is not retained")
+        if count > 1:
+            self._head_refcounts[index] = count - 1
+            return
+        self._head_refcounts.pop(index)
+        source = self._head_sources.pop(index)
+        self.head_cache.release_head_source(source.identity)
+        self._account_cpu()
+
+    def score(self, request: ScoreRequest, writer: TargetWriter) -> ScoreResult:
+        """
+        Score one microbatch's rows for one teacher and copy the requested hidden states into reserved CPU rows.
+
+        Args:
+            request ([`ScoreRequest`]):
+                Tokens, alignment metadata and requested completion positions.
+            writer ([`TargetWriter`]):
+                Writer bound to the reserved block rows, in `request.positions` order.
+
+        Returns:
+            [`ScoreResult`]: the completed target metadata.
+        """
+        self._check_open()
+        entry = self.registry.entries[request.teacher_index]
+        positions = request.positions
+        if positions.numel() != writer.rows.numel():
+            raise RuntimeError(
+                f"teacher '{entry.teacher_id}' was asked for {positions.numel()} targets but {writer.rows.numel()} "
+                "block rows are reserved"
+            )
+        if positions.numel() > 1 and bool((positions[1:] <= positions[:-1]).any()):
+            raise RuntimeError(
+                f"teacher '{entry.teacher_id}' received unsorted completion positions; row order must follow the "
+                "(sample, position) bookkeeping"
+            )
+        prompt_length, completion_length = request.prompt_length, request.completion_length
+        if request.input_ids.shape[1] != prompt_length + completion_length:
+            raise RuntimeError(
+                f"scoring request has {request.input_ids.shape[1]} tokens but prompt_length={prompt_length} and "
+                f"completion_length={completion_length}"
+            )
+        body = self._load_body(request.teacher_index)
+        backbone = _teacher_backbone(body)
+        device_state, device_bytes = self._device_state(backbone)
+        forward_calls = 0
+        offset = 0
+        try:
+            for start in range(0, request.input_ids.shape[0], self.scoring_batch_size):
+                stop = min(start + self.scoring_batch_size, request.input_ids.shape[0])
+                selected = positions[(positions >= start * completion_length) & (positions < stop * completion_length)]
+                if selected.numel() == 0:
+                    continue
+                input_ids = request.input_ids[start:stop].to(self.device)
+                attention_mask = request.attention_mask[start:stop].to(self.device)
+                with torch.no_grad(), self._autocast():
+                    output = torch.func.functional_call(
+                        backbone,
+                        device_state,
+                        args=(),
+                        kwargs={"input_ids": input_ids, "attention_mask": attention_mask, "use_cache": False},
+                        tie_weights=True,
+                        strict=True,
+                    )
+                hidden = output.last_hidden_state
+                if hidden.shape[1] != input_ids.shape[1]:
+                    raise RuntimeError(
+                        f"teacher '{entry.teacher_id}' returned {hidden.shape[1]} hidden states for "
+                        f"{input_ids.shape[1]} input tokens; the managed adapter requires full-length outputs before "
+                        "the causal shift"
+                    )
+                # Same alignment as `_get_last_hidden_state`: drop the next-token prediction, then keep the completion
+                # window, so row `k` is the state that predicts completion token `k`.
+                completion_hidden = hidden[:, :-1][:, prompt_length - 1 : prompt_length - 1 + completion_length]
+                rows = completion_hidden.reshape(-1, completion_hidden.shape[-1])
+                local = (selected - start * completion_length).to(self.device)
+                writer.write(offset, rows.index_select(0, local))
+                offset += selected.numel()
+                forward_calls += 1
+        finally:
+            device_state.clear()
+            self.stats.live_device_weight_bytes -= device_bytes
+        self.stats.forward_calls += forward_calls
+        self.stats.rows_scored += offset
+        if offset != positions.numel():
+            raise RuntimeError(
+                f"teacher '{entry.teacher_id}' scored {offset} of {positions.numel()} requested targets"
+            )
+        return ScoreResult(request.teacher_index, offset, entry.hidden_dtype, forward_calls)
+
+    def target_writer(self, block: HiddenTargetBlock, rows: torch.Tensor) -> TargetWriter:
+        """Bind a writer for `rows` of `block` to the staging tile, reallocating the tile when its shape changes."""
+        width = block.hidden.shape[1]
+        if (
+            self._staging is None
+            or self._staging.shape[1] != width
+            or self._staging.dtype != block.hidden.dtype
+            or self._staging.shape[0] != self.staging_rows
+        ):
+            self._staging = torch.empty(
+                (self.staging_rows, width), dtype=block.hidden.dtype, pin_memory=self.device.type == "cuda"
+            )
+            self.stats.staging_bytes = self._staging.numel() * self._staging.element_size()
+        return TargetWriter(block, rows, self._staging)
+
+    def evict_idle_gpu(self) -> None:
+        """Release idle device allocations: the head cache's slot. Scoring weights are released by [`score`] itself."""
+        self.head_cache.evict_idle_gpu()
+
+    def close(self) -> None:
+        """Release the body, the staging tile and every head source; rejects live target consumers. Idempotent."""
+        if self._head_refcounts:
+            raise RuntimeError(
+                f"cannot close the teacher executor while head sources are retained for teacher indices "
+                f"{sorted(self._head_refcounts)}; release the live targets first"
+            )
+        for index in list(self._head_sources):
+            source = self._head_sources.pop(index)
+            self.head_cache.release_head_source(source.identity)
+        self._release_body()
+        self._staging = None
+        self.stats.staging_bytes = 0
+        self._closed = True
+        self._account_cpu()
+
+    def reopen(self) -> None:
+        """Allow loading again after [`close`]; bodies are reloaded from the registry's pinned snapshots on demand."""
+        self._closed = False
+
+    def _check_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("the teacher executor is closed; call `reopen()` before scoring again")
+
+    def _autocast(self):
+        if self.autocast_dtype is None:
+            return contextlib.nullcontext()
+        return torch.autocast(device_type=self.device.type, dtype=self.autocast_dtype)
+
+    def _load_body(self, index: int) -> PreTrainedModel:
+        """Return the CPU body of teacher `index`, evicting the current occupant of the single slot when needed."""
+        self._check_open()
+        entry = self.registry.entries[index]
+        if not entry.evictable:
+            model = self.registry.preloaded_model(index)
+            model.eval()
+            return model
+        if self._body_key == entry.source_key:
+            return self._body
+        self._release_body()
+        budget = self.cpu_weight_budget_bytes
+        required = self._live_cpu_bytes() + entry.storage_bytes + entry.loading_transient_bytes
+        if budget is not None and required > budget:
+            raise ValueError(
+                f"Loading teacher '{entry.teacher_id}' needs {required} bytes of host weights (retained heads, "
+                f"non-evictable models, its {entry.storage_bytes}-byte body and a "
+                f"{entry.loading_transient_bytes}-byte loading transient) but `teacher_cpu_weight_budget_bytes` is "
+                f"{budget}."
+            )
+        loading_kwargs = {key: value for key, value in entry.loading_kwargs.items() if key != "revision"}
+        loading_kwargs["dtype"] = entry.source_dtype
+        loading_kwargs["device_map"] = None
+        loading_kwargs.setdefault("low_cpu_mem_usage", True)
+        loading_kwargs.setdefault("trust_remote_code", self.registry.trust_remote_code)
+        with _plain_loading_env():
+            model = create_model_from_path(entry.load_path, **loading_kwargs)
+        model.eval()
+        model.requires_grad_(False)
+        self._body = model
+        self._body_key = entry.source_key
+        self.stats.disk_bytes += entry.storage_bytes
+        if entry.source_key in self._loaded_keys:
+            self.stats.cpu_reloads += 1
+        self._loaded_keys.add(entry.source_key)
+        self._account_cpu()
+        logger.debug(
+            "Loaded teacher '%s' body from %s (%d bytes)", entry.teacher_id, entry.load_path, entry.storage_bytes
+        )
+        return model
+
+    def _release_body(self) -> None:
+        """Drop every alias of the current body: the module, its parameter/buffer dictionaries and their storages."""
+        if self._body is None:
+            return
+        body = self._body
+        self._body = None
+        self._body_key = None
+        # A CPU module keeps its storages alive through its own `_parameters`/`_buffers` dicts, so dropping our
+        # reference is not enough if anything else (a profiler, a traceback frame) still sees the module. Clearing the
+        # dicts releases the weights either way; a retained head source keeps only its own tensor alive.
+        for module in body.modules():
+            module._parameters.clear()
+            module._buffers.clear()
+        del body
+        self._account_cpu()
+
+    def _build_head_source(self, entry: TeacherEntry) -> HeadSource:
+        body = self._load_body(entry.index)
+        head = body.get_output_embeddings()
+        weight = head.weight.detach()
+        if weight.shape != entry.head_identity.weight_shape or weight.dtype != entry.head_identity.source_dtype:
+            raise RuntimeError(
+                f"teacher '{entry.teacher_id}' registered head {entry.head_identity.weight_shape} "
+                f"{entry.head_identity.source_dtype} but loaded {tuple(weight.shape)} {weight.dtype}"
+            )
+        pins_extra_storage = weight.untyped_storage().nbytes() != weight.numel() * weight.element_size()
+        if body.config.get_text_config().tie_word_embeddings or pins_extra_storage or not weight.is_contiguous():
+            # Tied or viewing heads would keep the input embedding (or an unrelated flattened buffer) alive for as long
+            # as any target is live; a compact copy costs one head transient and frees the body completely.
+            weight = weight.clone(memory_format=torch.contiguous_format)
+        bias = head.bias.detach().clone() if head.bias is not None else None
+        return HeadSource(identity=entry.head_identity, weight=weight, bias=bias)
+
+    def _device_state(self, backbone) -> tuple[dict, int]:
+        """
+        Build the disposable device parameter/buffer dict for one scoring forward.
+
+        `named_buffers()` yields non-persistent buffers too (persistence only affects `state_dict`), and tied
+        parameters appear once, which `functional_call(tie_weights=True)` re-ties. On a CPU device `.to()` returns the
+        source tensors themselves, so no copy happens there; the counters still record the dict build so eviction and
+        transfer accounting stay observable without an accelerator.
+        """
+        started = time.perf_counter()
+        state = {name: tensor.detach().to(self.device) for name, tensor in backbone.named_parameters()}
+        state.update({name: tensor.detach().to(self.device) for name, tensor in backbone.named_buffers()})
+        missing = sorted(set(backbone.state_dict().keys()) - set(state))
+        if missing:
+            raise RuntimeError(
+                f"the teacher backbone exposes state entries {missing} that the scoring adapter cannot substitute"
+            )
+        device_bytes = sum(
+            storage.nbytes()
+            for storage in {
+                tensor.untyped_storage().data_ptr(): tensor.untyped_storage() for tensor in state.values()
+            }.values()
+        )
+        if self.gpu_weight_budget_bytes is not None and device_bytes > self.gpu_weight_budget_bytes:
+            state.clear()
+            raise ValueError(
+                f"Scoring this teacher needs {device_bytes} bytes of device weights but "
+                f"`teacher_gpu_weight_budget_bytes` is {self.gpu_weight_budget_bytes}."
+            )
+        self.stats.backbone_uploads += 1
+        self.stats.upload_bytes += device_bytes
+        self.stats.upload_seconds += time.perf_counter() - started
+        self.stats.live_device_weight_bytes += device_bytes
+        self.stats.peak_device_weight_bytes = max(
+            self.stats.peak_device_weight_bytes, self.stats.live_device_weight_bytes
+        )
+        return state, device_bytes
+
+    def _live_cpu_bytes(self) -> int:
+        body_bytes = 0 if self._body_key is None else self.registry.entries[self._body_index()].storage_bytes
+        head_bytes = sum(self.registry.entries[index].head_bytes for index in self._head_sources)
+        return self._non_evictable_bytes + body_bytes + head_bytes
+
+    def _body_index(self) -> int:
+        return next(entry.index for entry in self.registry.entries if entry.source_key == self._body_key)
+
+    def _account_cpu(self) -> None:
+        self.stats.live_cpu_weight_bytes = self._live_cpu_bytes()
+        self.stats.peak_cpu_weight_bytes = max(self.stats.peak_cpu_weight_bytes, self.stats.live_cpu_weight_bytes)
