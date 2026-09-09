@@ -45,7 +45,9 @@ class TestDistillationConfigManagedDefaults(TrlTestCase):
     def test_teacher_model_init_kwargs_by_teacher_json_string_is_parsed(self):
         config = DistillationConfig(
             output_dir=self.tmp_dir,
-            teacher_model_init_kwargs_by_teacher='{"early": {"revision": "commit-a"}, "late": {"revision": "commit-b"}}',
+            teacher_model_init_kwargs_by_teacher=(
+                '{"early": {"revision": "commit-a"}, "late": {"revision": "commit-b"}}'
+            ),
         )
 
         assert config.teacher_model_init_kwargs_by_teacher == {

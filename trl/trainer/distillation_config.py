@@ -49,8 +49,8 @@ class DistillationConfig(_BaseConfig):
             from a string.
         teacher_model_init_kwargs_by_teacher (`str` or `dict[str, dict[str, Any]]`, *optional*):
             Per-teacher-ID overrides of `teacher_model_init_kwargs` for managed multi-teacher distillation (the
-            `teacher_models` mapping), e.g. `{"early": {"revision": "<commit-A>"}, "late": {"revision": "<commit-B>"}}`.
-            Common loading kwargs from `teacher_model_init_kwargs` apply first, then the per-ID overrides for that
+            `teacher_models` mapping), e.g. `{"early": {"revision": "<A>"}, "late": {"revision": "<B>"}}`. Common
+            loading kwargs from `teacher_model_init_kwargs` apply first, then the per-ID overrides for that
             teacher's ID.
         teacher_target_cache_bytes (`int`, *optional*, defaults to `1024**3`):
             Per-rank byte budget for the CPU-resident window of teacher hidden targets, for managed multi-teacher
