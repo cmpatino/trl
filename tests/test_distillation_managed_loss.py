@@ -119,7 +119,7 @@ def _case(B=2, K=6, H_s=8, V=17, n_masked=3, seed=0, bias=True, widths=(8,), sca
     scales = scales or [1.0] * len(widths)
     softcaps = softcaps or [None] * len(widths)
     specs = []
-    for index, (width, scale, softcap) in enumerate(zip(widths, scales, softcaps)):
+    for index, (width, scale, softcap) in enumerate(zip(widths, scales, softcaps, strict=True)):
         # Round-robin the valid rows over the teachers: disjoint groups whose union is the loss mask.
         owned = valid[index :: len(widths)]
         spec_mask = torch.zeros_like(mask).reshape(-1)
@@ -207,7 +207,7 @@ def _assert_parity(managed, legacy, atol=1e-6, rtol=1e-5):
     (managed_outputs, managed_grads), (legacy_outputs, legacy_grads) = managed, legacy
     torch.testing.assert_close(managed_outputs[0], legacy_outputs[0], atol=atol, rtol=rtol)
     torch.testing.assert_close(managed_outputs[1], legacy_outputs[1], atol=atol, rtol=rtol)
-    for managed_grad, legacy_grad in zip(managed_grads, legacy_grads):
+    for managed_grad, legacy_grad in zip(managed_grads, legacy_grads, strict=True):
         assert (managed_grad is None) == (legacy_grad is None)
         if managed_grad is not None:
             torch.testing.assert_close(managed_grad, legacy_grad, atol=atol, rtol=rtol)
@@ -367,7 +367,7 @@ class TestManagedLossParity(TrlTestCase):
                     num_teachers=len(case.specs),
                 )[0]
             else:
-                loss = sum(
+                total = sum(
                     _chunked_divergence_loss(
                         hidden,
                         spec.hidden,
@@ -381,11 +381,12 @@ class TestManagedLossParity(TrlTestCase):
                         teacher_lm_head_bias=spec.bias,
                     )[0]
                     for spec in case.specs
-                ) / case.n_valid
+                )
+                loss = total / case.n_valid
             loss.backward()
             optimizer.step()
             updated.append([p.detach().clone() for p in student.parameters()])
-        for managed_param, legacy_param in zip(*updated):
+        for managed_param, legacy_param in zip(*updated, strict=True):
             torch.testing.assert_close(managed_param, legacy_param, atol=1e-6, rtol=1e-5)
         cache.close()
 
@@ -687,7 +688,37 @@ class TestManagedLossLifecycle(TrlTestCase):
         uploads = cache.stats.uploads
         outputs[0].backward()
         assert cache.stats.uploads > uploads  # replay re-acquired the exact head
-        for managed_grad, resident_grad in zip((hidden.grad, weight.grad, bias.grad), resident_grads):
+        for managed_grad, resident_grad in zip((hidden.grad, weight.grad, bias.grad), resident_grads, strict=True):
+            torch.testing.assert_close(managed_grad, resident_grad, atol=0, rtol=0)
+        cache.close()
+        resident.close()
+
+    def test_forced_eviction_between_forward_and_backward_under_autocast(self):
+        # `_execution_dtype` reads the ambient autocast state, so the replay only re-acquires the head the forward
+        # pass projected through if non-reentrant checkpointing restores that state during recomputation. Evicting
+        # in between makes the replay upload observable, and the cache key pins the operand/execution dtypes.
+        case = _case(B=2, K=8, n_masked=0)  # float32 targets, float32 head source, bfloat16 autocast
+        resident = _cache(case)
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            _, resident_grads = _managed(case, resident, beta=0.5, chunk_size=4)
+
+        cache = _cache(case)
+        hidden = case.hidden.clone().requires_grad_(True)
+        weight = case.weight.clone().requires_grad_(True)
+        bias = case.bias.clone().requires_grad_(True)
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            outputs = managed_chunked_divergence_loss(
+                hidden, weight, bias, case.mask, [spec.group() for spec in case.specs], cache, 0.5, 4
+            )
+            forward_key = cache._key
+            assert forward_key == (case.specs[0].identity, torch.device("cpu"), torch.float32, torch.bfloat16)
+            uploads = cache.stats.uploads
+            cache.evict_idle_gpu()
+            assert cache._key is None and cache.stats.live_head_bytes == 0
+            outputs[0].backward()
+        assert cache._key == forward_key  # replay re-uploaded the very same head, dtypes included
+        assert cache.stats.uploads == uploads + 1  # exactly one re-upload for the one evicted head
+        for managed_grad, resident_grad in zip((hidden.grad, weight.grad, bias.grad), resident_grads, strict=True):
             torch.testing.assert_close(managed_grad, resident_grad, atol=0, rtol=0)
         cache.close()
         resident.close()
@@ -766,7 +797,7 @@ class TestManagedLossLifecycle(TrlTestCase):
         with torch.utils.checkpoint.set_checkpoint_early_stop(early_stop):
             _, grads = _managed(case, cache, beta=0.5, chunk_size=4)
         assert cache._leases == 0
-        for grad, expected_grad in zip(grads, expected):
+        for grad, expected_grad in zip(grads, expected, strict=True):
             torch.testing.assert_close(grad, expected_grad, atol=0, rtol=0)
         cache.close()
         reference.close()
@@ -901,18 +932,15 @@ class TestManagedLossLifecycle(TrlTestCase):
         cache = TeacherHeadCache(torch.device("cpu"))
         cache.retain_head_source(spec.source)
 
+        groups = [spec.group()]
         grads = []
         for run_managed in (True, False):
             student.zero_grad(set_to_none=True)
             hidden = backbone(input_ids=ids).last_hidden_state
             if run_managed:
-                loss = managed_chunked_divergence_loss(
-                    hidden, head_weight, None, mask, [spec.group()], cache, 0.5, 4
-                )[0]
+                loss, *_ = managed_chunked_divergence_loss(hidden, head_weight, None, mask, groups, cache, 0.5, 4)
             else:
-                loss = _chunked_divergence_loss(
-                    hidden, spec.hidden, head_weight, spec.weight, mask, 0.5, 4
-                )[0]
+                loss, *_ = _chunked_divergence_loss(hidden, spec.hidden, head_weight, spec.weight, mask, 0.5, 4)
             loss.backward()
             grads.append({name: p.grad.clone() for name, p in student.named_parameters() if p.grad is not None})
         assert grads[0] and all("lora_" in name for name in grads[0])

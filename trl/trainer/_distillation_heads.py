@@ -130,6 +130,10 @@ class TeacherHeadCache:
     lock because autograd worker threads acquire leases during checkpoint replay; a request for a different identity
     waits until the active leases drain rather than breaking the one-head bound.
 
+    Leases must never be nested: with one slot, a lease taken for a second identity while the first is still held
+    waits for that first lease to drain, so nesting them on one thread waits forever. `_managed_chunk` holds exactly
+    one lease at a time.
+
     On CPU the "upload" is a dtype-cast copy, so hit/miss/eviction accounting stays observable without an accelerator.
 
     Args:
