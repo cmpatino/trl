@@ -35,6 +35,7 @@ from accelerate.utils import is_peft_model
 from transformers import AutoConfig, AutoTokenizer, PreTrainedModel
 
 from ._distillation_heads import HeadIdentity, HeadSource, TargetGroup
+from ._distillation_identity import tokenizer_fingerprint
 from .utils import create_model_from_path
 
 
@@ -62,32 +63,6 @@ def _canonical_json(payload) -> str:
 
 def _sha256_json(payload) -> str:
     return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
-
-
-# TODO(W3 seam): switch to `_distillation_identity.tokenizer_fingerprint` once it lands; the payload here is already
-# the agreed one (canonical JSON of the fast tokenizer's full serialization plus special-token roles/IDs).
-def _tokenizer_fingerprint(tokenizer) -> str:
-    """
-    Fingerprint a fast tokenizer's complete serialization together with its special-token roles and IDs.
-
-    Args:
-        tokenizer ([`~transformers.PreTrainedTokenizerFast`]):
-            Tokenizer to fingerprint. Slow tokenizers have no canonical serialization and are rejected.
-
-    Returns:
-        `str`: hex sha256 digest over canonical JSON (sorted keys, no whitespace).
-    """
-    if not tokenizer.is_fast:
-        raise ValueError(
-            "Managed multi-teacher distillation fingerprints the fast tokenizer's serialization, but "
-            f"{type(tokenizer).__name__} is a slow tokenizer. Pass a fast tokenizer for the student and every teacher."
-        )
-    roles = {}
-    for role, value in tokenizer.special_tokens_map.items():
-        tokens = value if isinstance(value, list) else [value]
-        roles[role] = [[token, tokenizer.convert_tokens_to_ids(token)] for token in tokens]
-    payload = {"backend": json.loads(tokenizer.backend_tokenizer.to_str()), "special_tokens": roles}
-    return _sha256_json(payload)
 
 
 def _safetensors_header(path: Path) -> dict:
@@ -352,7 +327,7 @@ class TeacherRegistry:
         if unknown:
             raise ValueError(f"`teacher_tokenizers` has entries for unknown teacher IDs {unknown}.")
 
-        self.student_tokenizer_fingerprint = _tokenizer_fingerprint(student_tokenizer)
+        self.student_tokenizer_fingerprint = tokenizer_fingerprint(student_tokenizer)
         self.student_vocab_size = student_vocab_size
         self.trust_remote_code = trust_remote_code
         self.entries: list[TeacherEntry] = []
@@ -448,7 +423,9 @@ class TeacherRegistry:
 
     def manifest(self) -> dict:
         """
-        Allowlisted registry description for `teacher_manifest.json`; never contains tokens or credentials.
+        Allowlisted registry description consumed by [`TeacherManifest.from_registry`]; never contains credentials.
+
+        Dtypes stay `torch.dtype` objects and `head["weight_shape"]` a tuple: `from_registry` serializes them.
 
         Returns:
             `dict` with keys:
@@ -459,11 +436,12 @@ class TeacherRegistry:
                 - `student_tokenizer_fingerprint` (`str`):
                     Fingerprint every teacher tokenizer had to match.
                 - `teachers` (`list[dict]`):
-                    Per teacher: `id`, `index`, `source`, `resolved_revision`, `source_key`,
-                    `tokenizer_fingerprint`, `config_class`, `hidden_size`, `vocab_size`, `source_dtype`,
-                    `hidden_dtype`, `projection_dtype`, `weight_shape`, `has_bias`, `logit_scale`,
-                    `final_logit_softcapping`, `transform_version`, `adapter_version`, `evictable`,
-                    `storage_bytes` and the allowlisted `loading` kwargs.
+                    One entry per teacher in registry order, with keys `id`, `index`, `source`,
+                    `resolved_revision`, `source_key`, `tokenizer_fingerprint`, `source_dtype`, `hidden_dtype`,
+                    `projection_dtype`, `adapter_version`, `head` (`weight_shape`, `has_bias`, `source_dtype`,
+                    `logit_scale`, `final_logit_softcapping`, `transform_version`), plus the registry's own
+                    `config_class`, `hidden_size`, `vocab_size`, `evictable`, `storage_bytes` and allowlisted
+                    `loading` kwargs.
         """
         teachers = []
         for entry in self.entries:
@@ -481,15 +459,18 @@ class TeacherRegistry:
                     "config_class": entry.config_class,
                     "hidden_size": entry.hidden_size,
                     "vocab_size": entry.vocab_size,
-                    "source_dtype": str(entry.source_dtype),
-                    "hidden_dtype": str(entry.hidden_dtype),
-                    "projection_dtype": str(entry.projection_dtype),
-                    "weight_shape": list(entry.head_identity.weight_shape),
-                    "has_bias": entry.head_identity.has_bias,
-                    "logit_scale": entry.head_identity.logit_scale,
-                    "final_logit_softcapping": entry.head_identity.final_logit_softcapping,
-                    "transform_version": entry.head_identity.transform_version,
+                    "source_dtype": entry.source_dtype,
+                    "hidden_dtype": entry.hidden_dtype,
+                    "projection_dtype": entry.projection_dtype,
                     "adapter_version": entry.adapter_version,
+                    "head": {
+                        "weight_shape": entry.head_identity.weight_shape,
+                        "has_bias": entry.head_identity.has_bias,
+                        "source_dtype": entry.head_identity.source_dtype,
+                        "logit_scale": entry.head_identity.logit_scale,
+                        "final_logit_softcapping": entry.head_identity.final_logit_softcapping,
+                        "transform_version": entry.head_identity.transform_version,
+                    },
                     "evictable": entry.evictable,
                     "storage_bytes": entry.storage_bytes,
                     "loading": loading,
@@ -671,7 +652,7 @@ class TeacherRegistry:
                 f"{text_config.vocab_size}. Managed distillation projects targets through the teacher's own head and "
                 "cannot reconcile a padded head."
             )
-        fingerprint = _tokenizer_fingerprint(tokenizer)
+        fingerprint = tokenizer_fingerprint(tokenizer)
         if fingerprint != self.student_tokenizer_fingerprint:
             raise ValueError(
                 f"Teacher '{teacher_id}' has tokenizer fingerprint {fingerprint[:12]}... but the student's is "

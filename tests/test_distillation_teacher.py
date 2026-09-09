@@ -25,6 +25,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenize
 from transformers.testing_utils import torch_device
 
 from trl.trainer import _distillation_teacher as teacher_module
+from trl.trainer._distillation_identity import TeacherManifest, tokenizer_fingerprint
 from trl.trainer._distillation_teacher import (
     HiddenTargetBlock,
     ScoreRequest,
@@ -32,7 +33,6 @@ from trl.trainer._distillation_teacher import (
     TeacherRegistry,
     WindowStore,
     _resolve_hub_snapshot,
-    _tokenizer_fingerprint,
 )
 
 from .testing_utils import require_torch_accelerator
@@ -295,7 +295,7 @@ class TestTeacherRegistry:
         manifest = registry.manifest()
         assert manifest["version"] == 1
         assert manifest["identity_digest"] == registry.identity_digest()
-        assert manifest["student_tokenizer_fingerprint"] == _tokenizer_fingerprint(tokenizer)
+        assert manifest["student_tokenizer_fingerprint"] == tokenizer_fingerprint(tokenizer)
         teacher = manifest["teachers"][0]
         expected = {
             "id",
@@ -310,22 +310,57 @@ class TestTeacherRegistry:
             "source_dtype",
             "hidden_dtype",
             "projection_dtype",
-            "weight_shape",
-            "has_bias",
-            "logit_scale",
-            "final_logit_softcapping",
-            "transform_version",
             "adapter_version",
+            "head",
             "evictable",
             "storage_bytes",
             "loading",
         }
         assert set(teacher) == expected
-        assert teacher["weight_shape"] == [VOCAB_SIZE, HIDDEN_SIZE]
+        # `TeacherManifest.from_registry` serializes these itself, so they stay native here.
+        assert teacher["source_dtype"] == torch.float32
+        assert teacher["head"] == {
+            "weight_shape": (VOCAB_SIZE, HIDDEN_SIZE),
+            "has_bias": False,
+            "source_dtype": torch.float32,
+            "logit_scale": 1.0,
+            "final_logit_softcapping": None,
+            "transform_version": 1,
+        }
         assert teacher["config_class"] == "Qwen3Config"
         assert "hf_secret" not in str(manifest)
-        assert set(teacher["loading"]) <= {"dtype", "revision", "attn_implementation", "low_cpu_mem_usage",
-                                           "trust_remote_code"}
+        assert set(teacher["loading"]) <= {
+            "dtype",
+            "revision",
+            "attn_implementation",
+            "low_cpu_mem_usage",
+            "trust_remote_code",
+        }
+
+    def test_manifest_feeds_the_identity_manifest(self, tmp_path, sources, tokenizer):
+        registry = make_registry(
+            {"early": sources["a"], "late": sources["a_v2"]},
+            tokenizer,
+            common_init_kwargs={"token": "hf_secret"},
+        )
+        fingerprint = tokenizer_fingerprint(tokenizer)
+        saved = TeacherManifest.from_registry(
+            registry.manifest(),
+            student_tokenizer_fingerprint=fingerprint,
+            beta=1.0,
+            temperature=1.0,
+            chunk_size=256,
+        )
+        assert [entry["id"] for entry in saved.teachers] == ["early", "late"]
+        assert [entry["index"] for entry in saved.teachers] == [0, 1]
+        assert saved.teachers[0]["source_dtype"] == "torch.float32"
+        assert saved.teachers[0]["head"]["weight_shape"] == [VOCAB_SIZE, HIDDEN_SIZE]
+        assert saved.teachers[0]["source_key"] != saved.teachers[1]["source_key"]
+        saved.save(str(tmp_path))
+        assert "hf_secret" not in (tmp_path / "teacher_manifest.json").read_text()
+        reloaded = TeacherManifest.load(str(tmp_path))
+        assert reloaded == saved
+        saved.check_compatible(reloaded)
 
     def test_head_and_precision_records(self, sources, tokenizer):
         registry = make_registry({"early": sources["a"], "wide": sources["wide"]}, tokenizer)
