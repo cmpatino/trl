@@ -437,9 +437,10 @@ class TestManagedDeviceBoundaries(TrlTestCase):
         inputs = trainer._prepare_inputs(batch)
 
         # Every routing/payload tensor sits on the accelerator device, next to the tokens and the masks: a host
-        # `teacher_index` beside a device `completion_mask` is exactly what broke on GPU.
+        # `teacher_index` beside a device `completion_mask` is exactly what broke on GPU. Compared by device *type*:
+        # Accelerate's `device` carries no index (`cuda`), while a tensor's does (`cuda:0`).
         payload_device = inputs["completion_mask"].device
-        assert payload_device == trainer.accelerator.device
+        assert payload_device.type == trainer.accelerator.device.type
         for key in ("prompt_ids", "prompt_mask", "completion_ids", "completion_mask", "teacher_index"):
             assert inputs[key].device == payload_device, f"{key} is on {inputs[key].device}, not {payload_device}"
         assert inputs["teacher_index"].dtype == torch.int64
