@@ -188,17 +188,24 @@ describes compatibility with this managed lifecycle specifically, not general Tr
 
 | Mode | Status | Evidence |
 | --- | --- | --- |
-| Single device | Validation in progress, not yet supported | CPU: managed-vs-legacy update parity (bit-identical losses and parameters), window/accumulation, evaluation, resume, cleanup |
-| DDP | Validation in progress, not yet supported | CPU (gloo, two ranks): disjoint per-rank teachers, exact metric reduction, update matches a single-process reference to 3.7e-9. No device-memory evidence |
-| ZeRO-1/2 (student) | Validation in progress, not yet supported | Accepted by the trainer so it can be run; no run has happened |
-| FSDP2 (student) | Validation in progress, not yet supported | Accepted by the trainer so it can be run; no run has happened |
+| Single device | Validation in progress, not yet supported | CPU, and GPU (1× A10G) on tiny fixtures: managed-vs-legacy update parity (bit-identical losses and parameters), window/accumulation, evaluation, resume, cleanup. On GPU: 168 CUDA tests passed, including the accelerator-only head-cache/executor tests; managed-vs-legacy update bitwise; forced-eviction gradient parity 0 with no teacher head resident on device between forward and backward; the one-head device memory bound measured, not just designed |
+| DDP | Validation in progress, not yet supported | CPU (gloo, two ranks), and GPU (2× A10G) on tiny fixtures: disjoint per-rank teachers, exact metric reduction. On GPU: bitwise update parity, forced-eviction gradient parity, the one-head device memory bound measured on every rank |
+| ZeRO-1/2 (student) | Validation in progress, not yet supported | GPU (2× A10G, bf16) on tiny fixtures: bitwise update parity, but only when the managed teacher is registered in the engine's dtype (`teacher_model_init_kwargs={"dtype": "bfloat16"}`) — DeepSpeed casts the legacy teacher module to bf16, while the managed executor keeps the registered source dtype and autocasts matmuls in the engine dtype, so a fp32-registered managed teacher and the bf16-cast legacy one score different targets. Forced-eviction gradient parity and the one-head device memory bound also measured |
+| FSDP2 (student) | Validation in progress, not yet supported | GPU (2× A10G, bf16) on tiny fixtures: teacher targets identical between the two paths, and both loss implementations give identical gradients on identical inputs; the resulting optimizer update differs by 6.1e-6, i.e. 0.012 bf16 ULP after 4 steps, with the divergence traced to step 1's reduction order rather than any teacher/loss mismatch. Forced-eviction gradient parity and the one-head device memory bound also measured. **Caveat:** on Accelerate 1.14.0, FSDP2 keeps the student output head a plain (unsharded) parameter at loss time — the tail parameter group is never resharded — so the `DTensor.full_tensor()` head-materialization path is not exercised by this evidence |
+| Ten-teacher scale | Validation in progress, not yet supported | GPU (1 and 2 ranks) on tiny fixtures: peak device head bytes are constant across 1/2/5/10 registered teachers; teacher body loads grow with the number of *active* teachers per window; per-rank host PSS measured. Representative (multi-GB) teacher sizes have not been measured |
 | FSDP1, ZeRO-3, tensor/context/sequence parallelism, sharded teachers | Not supported | Rejected at initialization, naming the missing adapter |
 | Quantized or device-mapped teachers, VLM students | Not supported | Rejected at initialization, naming the missing adapter |
 
 A mode not listed as supported should be assumed unsupported even if it happens to run without an explicit error;
-only stages with landed evidence get promoted in this table. Nothing in this table has GPU evidence: every result
-above was produced on CPU, so the one-teacher-head and one-teacher-body *device* memory bounds are designed and
-instrumented but not measured.
+only stages with landed evidence get promoted in this table, and "validation in progress" never means "supported".
+GPU evidence above was measured on tiny test fixtures (a tiny student and tiny teachers derived from it), so it
+establishes the *shape* of the result (parity, bounds, scaling) rather than practical throughput or memory at
+representative teacher sizes; ten-teacher scale with representative (multi-GB) teachers, launcher termination after
+a rank failure, and vLLM generation interplay remain unmeasured.
+
+Separately, the legacy `teacher_model` path has a rough edge under FSDP that managed multi-teacher execution avoids:
+placing a preloaded teacher on the training device is left to the caller, since Accelerate's evaluation-mode model
+preparation does not move an unwrapped model onto the device by itself.
 
 ## Customization
 
