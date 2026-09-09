@@ -19,6 +19,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from safetensors.torch import load_file, save_file
 from tokenizers import Tokenizer, models, pre_tokenizers
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerFast, Qwen3Config, Qwen3ForCausalLM
 from transformers.testing_utils import torch_device
@@ -31,6 +32,7 @@ from trl.trainer._distillation_teacher import (
     TeacherExecutor,
     TeacherRegistry,
     WindowStore,
+    _checkpoint_inventory,
     _resolve_hub_snapshot,
 )
 
@@ -90,6 +92,24 @@ def save_source(directory, tokenizer, **kwargs):
     model.save_pretrained(directory)
     tokenizer.save_pretrained(directory)
     return str(directory)
+
+
+def overwrite_weights(directory, tensor_name="model.embed_tokens.weight", value=0.5):
+    """Replace one tensor's values in place, keeping its shape, dtype, the file size and `config.json` identical."""
+    path = Path(directory) / "model.safetensors"
+    tensors = load_file(str(path))
+    tensors[tensor_name] = torch.full_like(tensors[tensor_name], value)
+    save_file(tensors, str(path), metadata={"format": "pt"})
+
+
+def manifest_of(registry, tokenizer):
+    return TeacherManifest.from_registry(
+        registry.manifest(),
+        student_tokenizer_fingerprint=tokenizer_fingerprint(tokenizer),
+        beta=1.0,
+        temperature=1.0,
+        chunk_size=256,
+    )
 
 
 @pytest.fixture(scope="module")
@@ -912,6 +932,66 @@ class TestWindowStore:
         }
         with pytest.raises(ValueError, match="has no rows"):
             store.plan_window([empty], target_cache_bytes=1 << 20)
+
+
+class TestSourceContentIdentity:
+    """A source's identity must follow its tensor values: local paths are mutable and model objects have no files."""
+
+    def test_local_weight_replacement_changes_identity(self, tmp_path, tokenizer):
+        mutable = str(tmp_path / "repoMutable")
+        save_source(mutable, tokenizer, seed=5)
+        before = _checkpoint_inventory(mutable)
+        registry = make_registry({"mutable": mutable}, tokenizer)
+        overwrite_weights(mutable)
+        after = _checkpoint_inventory(mutable)
+        # Shapes, dtypes, file sizes and the config are untouched: only the values moved.
+        assert after["tensors"] == before["tensors"]
+        assert [entry[:2] for entry in after["files"]] == [entry[:2] for entry in before["files"]]
+        assert after["config_digest"] == before["config_digest"]
+        assert after["content_digest"] != before["content_digest"]
+        assert make_registry({"mutable": mutable}, tokenizer)["mutable"].source_key != registry["mutable"].source_key
+
+    def test_mutated_checkpoint_is_rejected_before_scoring(self, tmp_path, sources, tokenizer):
+        mutable = str(tmp_path / "repoMutable")
+        save_source(mutable, tokenizer, seed=5)
+        registry = make_registry({"mutable": mutable, "other": sources["a_v2"]}, tokenizer)
+        executor = make_executor(registry)
+        score_single(executor, registry, make_microbatch([0]), teacher_index=0)
+        head = executor.retain_head_source(0)
+        overwrite_weights(mutable)
+        executor._load_body(1)  # evict the pinned body, so the next use has to reload from disk
+        with pytest.raises(ValueError, match="changed since registration"):
+            score_single(executor, registry, make_microbatch([0]), teacher_index=0)
+        assert executor.stats.verify_bytes > 0
+        # The reload never happened, so the retained head still belongs to the registered content.
+        assert head.identity is registry["mutable"].head_identity
+        assert executor.stats.body_loads == 2
+
+    def test_mutated_checkpoint_fails_manifest_compatibility(self, tmp_path, sources, tokenizer):
+        mutable = str(tmp_path / "repoMutable")
+        save_source(mutable, tokenizer, seed=5)
+        teachers = {"mutable": mutable, "other": sources["a_v2"]}
+        registered = manifest_of(make_registry(teachers, tokenizer), tokenizer)
+        overwrite_weights(mutable)
+        mutated = manifest_of(make_registry(teachers, tokenizer), tokenizer)
+        with pytest.raises(ValueError):
+            registered.check_compatible(mutated)
+
+    def test_preloaded_identity_follows_parameter_values(self, tokenizer):
+        registries = {
+            name: make_registry({"live": build_model(seed=seed)}, tokenizer, teacher_tokenizers={"live": tokenizer})
+            for name, seed in (("first", 9), ("same", 9), ("other", 10))
+        }
+        first, same, other = (registries[name]["live"] for name in ("first", "same", "other"))
+        assert first.content_hashed_bytes > 0
+        # A different object with identical values stays the same source; different values do not.
+        assert first.content_digest == same.content_digest
+        assert first.source_key == same.source_key
+        assert first.content_digest != other.content_digest
+        assert first.source_key != other.source_key
+        manifest_of(registries["first"], tokenizer).check_compatible(manifest_of(registries["same"], tokenizer))
+        with pytest.raises(ValueError):
+            manifest_of(registries["first"], tokenizer).check_compatible(manifest_of(registries["other"], tokenizer))
 
 
 @require_torch_accelerator
