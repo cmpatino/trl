@@ -27,6 +27,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 from trl import DistillationConfig, DistillationTrainer
 from trl.trainer._distillation_teacher import (
     _TARGET_BLOCK_OVERHEAD_BYTES,
+    TeacherExecutor,
     WindowStore,
     _as_cpu,
     _microbatch_fingerprint,
@@ -454,10 +455,11 @@ class TestManagedDeviceBoundaries(TrlTestCase):
             assert group.positions.device.type == "cpu"
             assert group.positions.dtype == torch.int64
             assert group.hidden.device.type == "cpu"
-        # And the fingerprint the store compares is plain Python values, not device tensors.
-        fingerprint = _microbatch_fingerprint(inputs)
-        assert all(isinstance(value, (int, tuple)) for value in fingerprint)
-        assert all(isinstance(index, int) for index in fingerprint[3])
+        # And the fingerprint the store compares is a host-side digest of the payload values, not device tensors.
+        key = inputs["_teacher_targets_key"]
+        fingerprint = _microbatch_fingerprint(inputs, *key)
+        assert isinstance(fingerprint, str) and len(fingerprint) == 64
+        assert fingerprint == _microbatch_fingerprint(inputs, *key)
 
         trainer._teacher_store.release(inputs["_teacher_targets_key"])
         trainer.close_teachers()
@@ -821,6 +823,101 @@ class TestManagedFailureCleanup(TrlTestCase):
         assert all(param.grad is None for param in trainer.model.parameters())
         assert trainer._step == 0
         assert trainer._teacher_store.live_keys == []
+
+    @pytest.mark.parametrize("fail_at", [1, 2])
+    def test_a_scoring_failure_leaves_no_teacher_resources(self, teachers, fail_at):
+        """A first-score failure (`fail_at=1`) and a partial-window failure (`fail_at=2`) must own nothing after."""
+
+        class Boom(RuntimeError):
+            pass
+
+        real_score = TeacherExecutor.score
+        calls = {"count": 0}
+
+        def failing_score(executor, request, writer):
+            calls["count"] += 1
+            if calls["count"] == fail_at:
+                raise Boom("scoring failure")
+            return real_score(executor, request, writer)
+
+        training_args = DistillationConfig(
+            output_dir=self.tmp_dir,
+            learning_rate=0.1,
+            per_device_train_batch_size=2,
+            gradient_accumulation_steps=2,
+            max_completion_length=4,
+            max_steps=1,
+            report_to="none",
+        )
+        trainer = DistillationTrainer(
+            model=MODEL_ID,
+            args=training_args,
+            train_dataset=_routed_dataset(["a", "b"] * 8),
+            teacher_models=teachers,
+        )
+        with patch.object(TeacherExecutor, "score", failing_score), pytest.raises(Boom):
+            trainer.train()
+
+        assert trainer._teacher_store.live_keys == []
+        # The regression: a head retained for a group that then failed to score used to survive every cleanup path.
+        assert trainer._teacher_executor._head_refcounts == {}
+        assert trainer._teacher_executor._head_sources == {}
+        assert trainer._teacher_head_cache.stats.live_head_bytes == 0
+        assert trainer._teacher_executor.stats.live_device_weight_bytes == 0
+        assert all(param.grad is None for param in trainer.model.parameters())
+        assert (trainer.state.global_step, trainer._step) == (0, 0)
+        trainer.close_teachers()
+        # Reopening from registry metadata and training again works.
+        trainer.train()
+        assert trainer.state.global_step == 1
+
+    def test_a_backward_failure_after_an_accumulated_microbatch_clears_the_gradients(self, teachers):
+        class Boom(RuntimeError):
+            pass
+
+        class _RaiseInBackward(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, value):
+                return value.clone()
+
+            @staticmethod
+            def backward(ctx, grad_output):
+                raise Boom("backward failure")
+
+        class FailingBackwardTrainer(DistillationTrainer):
+            def _compute_loss(self, unwrapped_student, inputs, num_items_in_batch):
+                loss, entropy_sum, n_valid, teacher_stats = super()._compute_loss(
+                    unwrapped_student, inputs, num_items_in_batch
+                )
+                if self._step == 1:  # the second microbatch of the accumulation window
+                    loss = _RaiseInBackward.apply(loss)
+                return loss, entropy_sum, n_valid, teacher_stats
+
+        training_args = DistillationConfig(
+            output_dir=self.tmp_dir,
+            learning_rate=0.1,
+            per_device_train_batch_size=2,
+            gradient_accumulation_steps=2,
+            max_completion_length=4,
+            max_steps=1,
+            report_to="none",
+        )
+        trainer = FailingBackwardTrainer(
+            model=MODEL_ID,
+            args=training_args,
+            train_dataset=_routed_dataset(["a", "b"] * 8),
+            teacher_models=teachers,
+        )
+        with pytest.raises(Boom):
+            trainer.train()
+
+        # The first microbatch's backward completed, so this really tests accumulated gradients being invalidated.
+        assert trainer._step == 1
+        assert all(param.grad is None for param in trainer.model.parameters())
+        assert trainer.state.global_step == 0
+        assert trainer._teacher_store.live_keys == []
+        assert trainer._teacher_head_cache.stats.live_head_bytes == 0
+        trainer.close_teachers()
 
     def test_compute_loss_without_prepared_targets_raises(self, teachers):
         training_args = DistillationConfig(
