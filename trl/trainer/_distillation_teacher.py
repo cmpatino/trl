@@ -75,7 +75,12 @@ def _safetensors_header(path: Path) -> dict:
 
 
 def _checkpoint_files(path: str) -> list[Path]:
-    """The immutable files that define a local checkpoint's content: `config.json` then its safetensors shards."""
+    """
+    The immutable files that define a local checkpoint's content.
+
+    `config.json`, the shard index when the checkpoint is sharded (it decides which shard every tensor loads from),
+    then the safetensors shards in name order.
+    """
     root = Path(path)
     config_path = root / "config.json"
     if not config_path.is_file():
@@ -87,7 +92,9 @@ def _checkpoint_files(path: str) -> list[Path]:
             "reloads teacher bodies from immutable safetensors snapshots; re-save the checkpoint with "
             "`save_pretrained`."
         )
-    return [config_path, *weight_files]
+    index_path = root / "model.safetensors.index.json"
+    index_files = [index_path] if index_path.is_file() else []
+    return [config_path, *index_files, *weight_files]
 
 
 def _content_digest(path: str) -> tuple[str, int]:
@@ -119,31 +126,62 @@ def _content_digest(path: str) -> tuple[str, int]:
     return digest.hexdigest(), hashed
 
 
+def _hash_tensor_blocks(digest, tensor: torch.Tensor) -> int:
+    """
+    Feed one tensor's values through `digest` in bounded blocks, without ever materializing a full copy.
+
+    Slices along the first dimension are made contiguous one block at a time, so a non-contiguous source (a
+    transposed parameter, say) costs one block rather than a copy of the whole tensor. A single row is the smallest
+    block, so the bound is `max(_HASH_BLOCK_BYTES, one row)`. Logical element order is what gets hashed, so a
+    contiguous tensor and a non-contiguous view of the same values hash identically.
+
+    Args:
+        digest (`hashlib._Hash`):
+            Digest to update in place.
+        tensor (`torch.Tensor`):
+            Tensor to hash; moved to CPU without a copy when it already lives there.
+
+    Returns:
+        `int`: number of bytes hashed.
+    """
+    tensor = tensor.detach().to("cpu")
+    if tensor.numel() == 0:
+        return 0
+    if tensor.dim() == 0:
+        tensor = tensor.reshape(1)
+    rows = tensor.shape[0]
+    row_bytes = max(1, tensor.numel() // rows * tensor.element_size())
+    block_rows = max(1, _HASH_BLOCK_BYTES // row_bytes)
+    hashed = 0
+    for start in range(0, rows, block_rows):
+        block = tensor[start : start + block_rows].contiguous().reshape(-1).view(torch.uint8).numpy().tobytes()
+        digest.update(block)
+        hashed += len(block)
+    return hashed
+
+
 def _tensor_content_digest(model: PreTrainedModel) -> tuple[str, int]:
     """
     Stream a preloaded model's parameter and buffer values through sha256 in bounded blocks.
 
     A caller-provided model has no file identity, so its values are its identity: without them two models sharing a
     config and parameter shapes would resolve to the same source, and manifest validation could not reject a changed
-    teacher on resume.
+    teacher on resume. Non-persistent buffers are included — `state_dict()` omits them, but they take part in the
+    forward (Qwen3's rotary `inv_freq` is one), so a change to them changes the teacher's distribution.
 
     Args:
         model ([`~transformers.PreTrainedModel`]):
-            CPU model to fingerprint. Tensors are read in `state_dict()` key order.
+            CPU model to fingerprint. Parameters and buffers are hashed in sorted-name order.
 
     Returns:
         `tuple[str, int]`: hex sha256 digest and the number of tensor bytes hashed.
     """
     digest = hashlib.sha256()
     hashed = 0
-    for name, tensor in model.state_dict().items():
+    tensors = sorted([*model.named_parameters(), *model.named_buffers()], key=lambda item: item[0])
+    for name, tensor in tensors:
         digest.update(f"{name}|{tensor.dtype}|{tuple(tensor.shape)}".encode())
-        flat = tensor.detach().to("cpu").reshape(-1)
-        block_elements = max(1, _HASH_BLOCK_BYTES // flat.element_size())
-        for start in range(0, flat.numel(), block_elements):
-            block = flat[start : start + block_elements].contiguous().view(torch.uint8).numpy().tobytes()
-            digest.update(block)
-            hashed += len(block)
+        hashed += _hash_tensor_blocks(digest, tensor)
     return digest.hexdigest(), hashed
 
 
@@ -176,7 +214,10 @@ def _checkpoint_inventory(path: str) -> dict:
             - `hashed_bytes` (`int`):
                 Bytes hashed to produce `content_digest`.
     """
-    config_path, *weight_files = _checkpoint_files(path)
+    content_files = _checkpoint_files(path)
+    config_path = content_files[0]
+    # The shard index is part of the content digest but has no tensor header to read.
+    weight_files = [file_path for file_path in content_files if file_path.suffix == ".safetensors"]
     tensors = {}
     files = []
     numel = 0
@@ -314,12 +355,16 @@ class TeacherEntry:
     configuration. `projection_dtype` is the matmul execution dtype the managed loss reproduces on replay.
 
     `content_digest` is the source's value-level identity: a streaming digest of the checkpoint files for path/Hub
-    sources, or of the parameter and buffer values for a preloaded model.
+    sources, or of the parameter and buffer values for a preloaded model. `identity_source` is the part of the source
+    that belongs to that identity — a Hub repository id, or `None` for a local checkpoint or a preloaded model, whose
+    identity is entirely their content. `source` and `load_path` stay as display and reload metadata: the same
+    checkpoint staged under different per-rank paths must produce one identity.
     """
 
     teacher_id: str
     index: int
     source: str | None
+    identity_source: str | None
     resolved_revision: str | None
     source_key: str
     config_class: str
@@ -476,12 +521,18 @@ class TeacherRegistry:
         return indices
 
     def identity_digest(self) -> str:
-        """Digest over every entry's identity fields, compared once across ranks by the trainer."""
+        """
+        Digest over every entry's identity fields, compared once across ranks by the trainer.
+
+        Covers content digests, Hub repository/revision, precision policy and head identity, but no local path and no
+        observed dtype: ranks that stage the same checkpoint under different directories, or that have not scored yet,
+        must still agree.
+        """
         payload = [
             {
                 "teacher_id": entry.teacher_id,
                 "index": entry.index,
-                "source": entry.source,
+                "identity_source": entry.identity_source,
                 "resolved_revision": entry.resolved_revision,
                 "source_key": entry.source_key,
                 "config_class": entry.config_class,
@@ -591,10 +642,14 @@ class TeacherRegistry:
                     "separate teacher IDs instead."
                 )
             load_path, resolved_revision = source, None
+            # A local checkpoint is identified by its content alone: the path is where it happens to be staged, and
+            # ranks may stage the same files under different directories.
+            identity_source = None
         else:
             load_path, resolved_revision = _resolve_hub_snapshot(
                 source, revision, loading_kwargs.get("token", loading_kwargs.get("use_auth_token"))
             )
+            identity_source = source
         inventory = _checkpoint_inventory(load_path)
         config = AutoConfig.from_pretrained(load_path, trust_remote_code=self.trust_remote_code)
         text_config = config.get_text_config()
@@ -609,7 +664,7 @@ class TeacherRegistry:
         source_key = _sha256_json(
             {
                 "kind": "path" if resolved_revision is None else "hub",
-                "source": source,
+                "source": identity_source,
                 "revision": resolved_revision,
                 "content": {
                     "digest": inventory["content_digest"],
@@ -629,6 +684,7 @@ class TeacherRegistry:
             teacher_id=teacher_id,
             index=index,
             source=source,
+            identity_source=identity_source,
             resolved_revision=resolved_revision,
             source_key=source_key,
             text_config=text_config,
@@ -694,6 +750,7 @@ class TeacherRegistry:
             teacher_id=teacher_id,
             index=index,
             source=None,
+            identity_source=None,
             resolved_revision=None,
             source_key=source_key,
             text_config=text_config,
@@ -723,6 +780,7 @@ class TeacherRegistry:
         teacher_id,
         index,
         source,
+        identity_source,
         resolved_revision,
         source_key,
         text_config,
@@ -774,6 +832,7 @@ class TeacherRegistry:
             teacher_id=teacher_id,
             index=index,
             source=source,
+            identity_source=identity_source,
             resolved_revision=resolved_revision,
             source_key=source_key,
             config_class=config_class,
