@@ -457,6 +457,21 @@ class TestManagedLossPrecision(TrlTestCase):
             )
         cache.close()
 
+    @pytest.mark.parametrize("hidden_dtype", [torch.bfloat16, torch.float16])
+    def test_parity_for_narrow_targets_without_autocast(self, hidden_dtype):
+        # Without autocast the execution dtype is the targets' own dtype, so a float32 source is cast once.
+        case = _case(B=2, K=8, n_masked=0)
+        case.specs[0].hidden = case.specs[0].hidden.to(hidden_dtype)
+        cache = _cache(case)
+        _assert_parity(
+            _managed(case, cache, beta=0.5, chunk_size=4),
+            _legacy(case, beta=0.5, chunk_size=4, denom=case.n_valid),
+            atol=0,
+            rtol=0,
+        )
+        assert cache._weight.dtype == hidden_dtype
+        cache.close()
+
     def test_parity_under_bf16_autocast_with_several_teachers(self):
         case = _case(B=2, K=8, n_masked=2, widths=(8, 5, 12), scales=(1.0, 1.3, 0.6), softcaps=(None, 30.0, 50.0))
         for spec in case.specs:
@@ -645,4 +660,250 @@ class TestHeadCacheLeases(TrlTestCase):
                 assert head.weight.dtype == torch.bfloat16
         one_head = case.specs[0].weight.numel() * 2 + case.specs[0].bias.numel() * 4
         assert torch.accelerator.max_memory_allocated(torch_device) - baseline < 2 * one_head
+        cache.close()
+
+
+class TestManagedLossLifecycle(TrlTestCase):
+    """Eviction, replay, exceptions and metrics around the checkpointed chunks."""
+
+    def test_forced_eviction_between_forward_and_backward(self):
+        # The decisive test from the design: evict the idle head between loss forward and backward and require the
+        # same gradients as a run that kept it resident.
+        case = _case(B=2, K=8, n_masked=0)
+        resident = _cache(case)
+        _, resident_grads = _managed(case, resident, beta=0.5, chunk_size=4)
+
+        cache = _cache(case)
+        hidden = case.hidden.clone().requires_grad_(True)
+        weight = case.weight.clone().requires_grad_(True)
+        bias = case.bias.clone().requires_grad_(True)
+        outputs = managed_chunked_divergence_loss(
+            hidden, weight, bias, case.mask, [spec.group() for spec in case.specs], cache, 0.5, 4
+        )
+        cache.evict_idle_gpu()
+        assert cache._weight is None and cache._bias is None
+        assert cache.stats.live_head_bytes == 0
+        uploads = cache.stats.uploads
+        outputs[0].backward()
+        assert cache.stats.uploads > uploads  # replay re-acquired the exact head
+        for managed_grad, resident_grad in zip((hidden.grad, weight.grad, bias.grad), resident_grads):
+            torch.testing.assert_close(managed_grad, resident_grad, atol=0, rtol=0)
+        cache.close()
+        resident.close()
+
+    def test_repeated_chunks_of_one_head_hit_and_switches_miss(self):
+        # Two teachers with eight rows each at a chunk size of four: one miss then one hit per teacher.
+        case = _case(B=2, K=8, n_masked=0, widths=(8, 5))
+        cache = _cache(case)
+        _managed(case, cache, beta=0.5, chunk_size=4, backward=False)
+        assert (cache.stats.misses, cache.stats.hits) == (2, 2)
+        cache.close()
+
+    def test_alternating_groups_force_a_miss_per_chunk(self):
+        case = _case(B=2, K=8, n_masked=0, widths=(8, 5))
+        cache = _cache(case)
+        first, second = (_halves(spec.group()) for spec in case.specs)
+        groups = [first[0], second[0], first[1], second[1]]
+        hidden = case.hidden.clone().requires_grad_(True)
+        loss = managed_chunked_divergence_loss(
+            hidden, case.weight, case.bias, case.mask, groups, cache, 0.5, 4, num_teachers=2
+        )[0]
+        assert (cache.stats.misses, cache.stats.hits) == (4, 0)
+        loss.backward()
+        assert cache.stats.misses > 4  # replay alternates again
+        cache.close()
+
+    def test_application_exception_from_the_chunk_body_propagates(self, monkeypatch):
+        case = _case()
+        cache = _cache(case)
+        monkeypatch.setattr(_distillation_loss, "F", _FailingFunctional(after=0))
+        with pytest.raises(_ChunkFailure):
+            _managed(case, cache, beta=0.5, chunk_size=4, backward=False)
+        assert cache._leases == 0
+        cache.evict_idle_gpu()
+        assert cache.stats.live_head_bytes == 0
+        cache.close()
+
+    def test_application_exception_during_replay_propagates(self, monkeypatch):
+        case = _case()
+        cache = _cache(case)
+        failing = _FailingFunctional(after=10**6)
+        monkeypatch.setattr(_distillation_loss, "F", failing)
+        outputs, _ = _managed(case, cache, beta=0.5, chunk_size=4, backward=False)
+        failing.after = failing.calls  # the next call is the first one of the recomputation
+        with pytest.raises(_ChunkFailure):
+            outputs[0].backward()
+        assert cache._leases == 0
+        cache.evict_idle_gpu()
+        assert cache.stats.live_head_bytes == 0
+        cache.close()
+
+    def test_exception_inside_the_lease_releases_it(self):
+        # A target width that disagrees with the retained head makes the projection itself raise, with the lease held.
+        case = _case()
+        group = case.specs[0].group()
+        broken = TargetGroup(group.identity, 0, group.hidden[:, :-1].contiguous(), group.positions)
+        cache = _cache(case)
+        with pytest.raises(RuntimeError):
+            managed_chunked_divergence_loss(
+                case.hidden.clone().requires_grad_(True), case.weight, case.bias, case.mask, [broken], cache, 0.5, 4
+            )
+        assert cache._leases == 0
+        cache.evict_idle_gpu()
+        assert cache._weight is None
+        cache.close()
+
+    @pytest.mark.parametrize("early_stop", [True, False])
+    def test_checkpoint_early_stop_leaves_gradients_unchanged(self, early_stop):
+        # The chunk returns metric sums after the last tensor the backward needs, so non-reentrant checkpointing's
+        # default early stop interrupts the recomputation. Gradients must not depend on that.
+        case = _case(K=8, widths=(8, 5))
+        reference = _cache(case)
+        with torch.utils.checkpoint.set_checkpoint_early_stop(False):
+            _, expected = _managed(case, reference, beta=0.5, chunk_size=4)
+        cache = _cache(case)
+        with torch.utils.checkpoint.set_checkpoint_early_stop(early_stop):
+            _, grads = _managed(case, cache, beta=0.5, chunk_size=4)
+        assert cache._leases == 0
+        for grad, expected_grad in zip(grads, expected):
+            torch.testing.assert_close(grad, expected_grad, atol=0, rtol=0)
+        cache.close()
+        reference.close()
+
+    def test_teacher_sources_receive_no_gradient(self):
+        case = _case(K=8, widths=(8, 5))
+        for spec in case.specs:
+            # A caller-provided teacher is not frozen by `prepare_model`, so its head may still require grad.
+            spec.weight.requires_grad_(True)
+            spec.bias.requires_grad_(True)
+        cache = _cache(case)
+        _managed(case, cache, beta=0.5, chunk_size=4)
+        for spec in case.specs:
+            assert spec.weight.grad is None and spec.bias.grad is None
+            assert spec.weight.requires_grad and spec.bias.requires_grad  # left as the caller set them
+            assert not spec.group().hidden.requires_grad
+        cache.close()
+
+    def test_no_device_teacher_head_is_captured(self):
+        # Nothing outside the cache slot may hold the projected head: not a checkpoint argument, closure or graph
+        # node. If anything did, the weak reference would survive eviction.
+        case = _case(B=2, K=8, n_masked=0)
+        cache = _cache(case)
+        hidden = case.hidden.clone().requires_grad_(True)
+        outputs = managed_chunked_divergence_loss(
+            hidden, case.weight, case.bias, case.mask, [spec.group() for spec in case.specs], cache, 0.5, 4
+        )
+        leased = weakref.ref(cache._weight)
+        cache.evict_idle_gpu()
+        gc.collect()
+        assert leased() is None
+        outputs[0].backward()  # the graph still replays with the head gone
+        assert hidden.grad is not None
+        assert cache.stats.uploads == 2  # one upload in the forward pass, one in the replay
+        cache.close()
+
+    @pytest.mark.parametrize("with_empty_group", [False, True])
+    def test_all_masked_microbatch_is_a_differentiable_zero(self, with_empty_group):
+        # A nonempty all-masked microbatch has no teacher targets, but its zero loss must still reach the student
+        # backbone output and the head weight and bias, or gradient synchronization deadlocks.
+        case = _case()
+        cache = _cache(case)
+        mask = torch.zeros_like(case.mask)
+        hidden = case.hidden.clone().requires_grad_(True)
+        weight = case.weight.clone().requires_grad_(True)
+        bias = case.bias.clone().requires_grad_(True)
+        groups = []
+        if with_empty_group:
+            spec = case.specs[0]
+            groups = [
+                TargetGroup(
+                    spec.identity,
+                    0,
+                    spec.hidden.reshape(-1, spec.hidden.size(-1))[:0].contiguous(),
+                    torch.zeros(0, dtype=torch.int64),
+                )
+            ]
+        loss, entropy, n_valid, stats = managed_chunked_divergence_loss(
+            hidden, weight, bias, mask, groups, cache, 0.5, 4
+        )
+        assert int(n_valid.item()) == 0
+        assert torch.isfinite(loss) and loss.item() == 0.0
+        assert entropy.item() == 0.0
+        assert torch.equal(stats, torch.zeros_like(stats))
+        loss.backward()
+        for grad in (hidden.grad, weight.grad, bias.grad):
+            assert grad is not None
+            assert torch.equal(grad, torch.zeros_like(grad))
+        assert cache.stats.uploads == 0  # no teacher head is needed at all
+        cache.close()
+
+    def test_zero_row_microbatch_raises(self):
+        cache = TeacherHeadCache(torch.device("cpu"))
+        with pytest.raises(ValueError, match="no rows"):
+            managed_chunked_divergence_loss(
+                torch.zeros(0, 4, 8), torch.zeros(17, 8), None, torch.zeros(0, 4), [], cache, 0.5, 4
+            )
+        cache.close()
+
+    def test_teacher_stats_columns(self):
+        case = _case(B=2, K=8, n_masked=2, widths=(8, 5))
+        cache = _cache(case)
+        outputs, _ = _managed(case, cache, beta=0.5, chunk_size=4, num_teachers=4)
+        stats = outputs[3]
+        assert stats.shape == (3, 4)
+        assert stats.dtype == torch.float32
+        assert not stats.requires_grad
+        assert torch.equal(stats[:, 2:], torch.zeros(3, 2))  # registered but absent teachers stay zero
+        for spec in case.specs:
+            assert stats[2, spec.index].item() == int(spec.mask.sum().item())
+            group = spec.group()
+            log_probs = torch.log_softmax(group.hidden @ spec.weight.t() + spec.bias, dim=-1)
+            expected = -(log_probs.exp() * log_probs).sum(dim=-1).sum()
+            torch.testing.assert_close(stats[1, spec.index], expected, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(stats[0].sum() / case.n_valid, outputs[0].detach(), atol=1e-6, rtol=1e-5)
+        cache.close()
+
+    @require_peft
+    def test_peft_lora_student_matches_legacy(self):
+        # LoRA adapters are the only trainable parameters, and the frozen `lm_head` is shared by both paths.
+        base = AutoModelForCausalLM.from_pretrained("trl-internal-testing/tiny-Qwen3ForCausalLM", dtype=torch.float32)
+        student = get_peft_model(
+            base, LoraConfig(r=4, lora_alpha=8, target_modules=["q_proj", "v_proj"], task_type="CAUSAL_LM")
+        )
+        backbone = student.get_base_model().model
+        head_weight = student.get_base_model().lm_head.weight
+        vocab_size, hidden_size = head_weight.shape
+        generator = torch.Generator().manual_seed(4)
+        ids = torch.randint(0, vocab_size, (2, 4), generator=generator)
+        mask = torch.ones(2, 4)
+        mask[1, -1] = 0
+        spec = _Spec(
+            teacher_id="peft-teacher",
+            hidden=torch.randn(2, 4, 6, generator=generator),
+            weight=torch.randn(vocab_size, 6, generator=generator) * 0.02,
+            mask=mask,
+        )
+        cache = TeacherHeadCache(torch.device("cpu"))
+        cache.retain_head_source(spec.source)
+
+        grads = []
+        for run_managed in (True, False):
+            student.zero_grad(set_to_none=True)
+            hidden = backbone(input_ids=ids).last_hidden_state
+            if run_managed:
+                loss = managed_chunked_divergence_loss(
+                    hidden, head_weight, None, mask, [spec.group()], cache, 0.5, 4
+                )[0]
+            else:
+                loss = _chunked_divergence_loss(
+                    hidden, spec.hidden, head_weight, spec.weight, mask, 0.5, 4
+                )[0]
+            loss.backward()
+            grads.append({name: p.grad.clone() for name, p in student.named_parameters() if p.grad is not None})
+        assert grads[0] and all("lora_" in name for name in grads[0])
+        assert grads[0].keys() == grads[1].keys()
+        for name in grads[0]:
+            torch.testing.assert_close(grads[0][name], grads[1][name], atol=1e-6, rtol=1e-5)
+        assert head_weight.grad is None and not head_weight.requires_grad
+        assert hidden_size == 8
         cache.close()
