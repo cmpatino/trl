@@ -14,11 +14,15 @@
 
 """Tests for the managed multi-teacher registry, scoring executor and window store (`_distillation_teacher.py`)."""
 
+import hashlib
+import json
+import shutil
 import weakref
 from pathlib import Path
 
 import pytest
 import torch
+import torch.nn as nn
 from safetensors.torch import load_file, save_file
 from tokenizers import Tokenizer, models, pre_tokenizers
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerFast, Qwen3Config, Qwen3ForCausalLM
@@ -33,7 +37,10 @@ from trl.trainer._distillation_teacher import (
     TeacherExecutor,
     TeacherRegistry,
     WindowStore,
+    _checkpoint_files,
     _checkpoint_inventory,
+    _content_digest,
+    _hash_tensor_blocks,
     _resolve_hub_snapshot,
 )
 
@@ -999,6 +1006,98 @@ class TestSourceContentIdentity:
         mutated = manifest_of(make_registry(teachers, tokenizer), tokenizer)
         with pytest.raises(ValueError):
             registered.check_compatible(mutated)
+
+    def test_same_content_at_two_paths_is_one_identity(self, tmp_path, tokenizer):
+        first, second = str(tmp_path / "stage-a"), str(tmp_path / "stage-b")
+        save_source(first, tokenizer, seed=6)
+        shutil.copytree(first, second)
+        staged_first = make_registry({"early": first}, tokenizer)
+        staged_second = make_registry({"early": second}, tokenizer)
+        # Ranks may stage the same checkpoint under different directories; the identity must not depend on where.
+        assert staged_first["early"].source_key == staged_second["early"].source_key
+        assert staged_first.identity_digest() == staged_second.identity_digest()
+        assert staged_first["early"].identity_source is None
+        # The path survives as display and reload metadata.
+        assert (staged_first["early"].source, staged_first["early"].load_path) == (first, first)
+        assert (staged_second["early"].source, staged_second["early"].load_path) == (second, second)
+        overwrite_weights(second)
+        mutated = make_registry({"early": second}, tokenizer)
+        assert mutated["early"].source_key != staged_second["early"].source_key
+        assert mutated.identity_digest() != staged_second.identity_digest()
+
+    def test_hub_identity_keeps_repository_and_revision(self, monkeypatch, sources, tokenizer):
+        monkeypatch.setattr(
+            teacher_module, "_resolve_hub_snapshot", lambda repo_id, revision, token=None: (sources["a"], "e" * 40)
+        )
+        hub = make_registry({"early": "org/teacher"}, tokenizer)["early"]
+        local = make_registry({"early": sources["a"]}, tokenizer)["early"]
+        assert hub.identity_source == "org/teacher" and hub.resolved_revision == "e" * 40
+        assert local.identity_source is None
+        # Same files, but a Hub source is pinned to its repository and commit, so the identities differ.
+        assert hub.content_digest == local.content_digest
+        assert hub.source_key != local.source_key
+
+    def test_shard_index_is_part_of_the_content_digest(self, tmp_path, tokenizer):
+        sharded = str(tmp_path / "repoSharded")
+        model = build_model(seed=7)
+        model.save_pretrained(sharded, max_shard_size="4KB")
+        tokenizer.save_pretrained(sharded)
+        index_path = Path(sharded) / "model.safetensors.index.json"
+        assert index_path.is_file()  # the checkpoint really is sharded
+        assert index_path in _checkpoint_files(sharded)
+        registry = make_registry({"sharded": sharded}, tokenizer)
+        before, _ = _content_digest(sharded)
+        # Point one tensor at another shard: the weight files are untouched, only the loading map moved.
+        index = json.loads(index_path.read_text())
+        names = sorted(index["weight_map"])
+        shards = sorted(set(index["weight_map"].values()))
+        index["weight_map"][names[0]] = shards[-1]
+        index_path.write_text(json.dumps(index))
+        after, _ = _content_digest(sharded)
+        assert after != before
+        assert make_registry({"sharded": sharded}, tokenizer)["sharded"].source_key != registry["sharded"].source_key
+
+    def test_preloaded_identity_covers_non_persistent_buffers(self, tokenizer):
+        base = build_model(seed=9)
+        mutated = build_model(seed=9)
+        # Qwen3's rotary `inv_freq` is a non-persistent buffer: absent from `state_dict`, but it shapes every forward.
+        assert not any("inv_freq" in name for name in mutated.state_dict())
+        mutated.model.rotary_emb.inv_freq.mul_(3.0)
+        input_ids = torch.tensor([[1, 2, 3, 4]])
+        with torch.no_grad():
+            assert not torch.allclose(base(input_ids=input_ids).logits, mutated(input_ids=input_ids).logits)
+        registries = {
+            name: make_registry({"live": model}, tokenizer, teacher_tokenizers={"live": tokenizer})
+            for name, model in (("base", base), ("mutated", mutated))
+        }
+        assert registries["base"]["live"].source_key != registries["mutated"]["live"].source_key
+        base_manifest = manifest_of(registries["base"], tokenizer)
+        mutated_manifest = manifest_of(registries["mutated"], tokenizer)
+        with pytest.raises(ValueError):
+            base_manifest.check_compatible(mutated_manifest)
+
+    def test_non_contiguous_values_hash_identically_in_bounded_blocks(self, monkeypatch, tokenizer):
+        contiguous = build_model(seed=9)
+        viewed = build_model(seed=9)
+        weight = viewed.model.layers[0].mlp.gate_proj.weight
+        transposed = weight.data.t().contiguous().t()  # same values, non-contiguous layout
+        assert not transposed.is_contiguous() and torch.equal(transposed, weight.data)
+        viewed.model.layers[0].mlp.gate_proj.weight = nn.Parameter(transposed)
+        registries = {
+            name: make_registry({"live": model}, tokenizer, teacher_tokenizers={"live": tokenizer})
+            for name, model in (("contiguous", contiguous), ("viewed", viewed))
+        }
+        contiguous_entry, viewed_entry = registries["contiguous"]["live"], registries["viewed"]["live"]
+        assert contiguous_entry.content_digest == viewed_entry.content_digest
+        assert contiguous_entry.content_hashed_bytes == viewed_entry.content_hashed_bytes
+        # A tiny block size must not change the digest: slices are hashed in logical order, one block at a time.
+        monkeypatch.setattr(teacher_module, "_HASH_BLOCK_BYTES", 8)
+        digests = []
+        for tensor in (weight.data, transposed):
+            digest = hashlib.sha256()
+            assert _hash_tensor_blocks(digest, tensor) == tensor.numel() * tensor.element_size()
+            digests.append(digest.hexdigest())
+        assert digests[0] == digests[1]
 
     def test_preloaded_identity_follows_parameter_values(self, tokenizer):
         registries = {
