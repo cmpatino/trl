@@ -862,6 +862,101 @@ class TestWindowStore:
         assert plan.microbatch_indices == [0]
         assert plan.teacher_indices == [0]
 
+    @pytest.mark.parametrize("count", [1, 3])
+    def test_window_uploads_one_backbone_per_teacher(self, sources, tokenizer, count):
+        registry, executor, store, microbatches = make_window(sources, tokenizer, count=count)
+        plan = store.plan_window(microbatches, target_cache_bytes=1 << 20)
+        store.score_window(plan, executor, microbatches)
+        # One upload per teacher present in the window, whatever the accumulation size: the device backbone is held
+        # across all of that teacher's microbatches instead of being rebuilt per group.
+        assert plan.teacher_indices == [0, 1]
+        assert executor.stats.backbone_uploads == 2
+        assert executor.stats.body_loads == 2
+        assert executor.stats.forward_calls == 2 * count  # one row per teacher per microbatch, batch size 1
+        assert executor.stats.live_device_weight_bytes == 0
+
+    def test_uploads_are_amortized_per_window_not_per_microbatch(self, sources, tokenizer):
+        registry, executor, store, microbatches = make_window(sources, tokenizer, count=3)
+        budget = 2 * ROWS_PER_MICROBATCH * BLOCK_BYTES + 4096
+        first = store.plan_window(microbatches, target_cache_bytes=budget)
+        assert first.microbatch_indices == [0, 1]
+        store.score_window(first, executor, microbatches)
+        assert executor.stats.backbone_uploads == 2
+        for index in first.microbatch_indices:
+            store.release((0, index))
+        second = store.plan_window(microbatches, target_cache_bytes=budget, start_index=2)
+        store.score_window(second, executor, microbatches)
+        # A second window pays a second pair of uploads; nothing pays per microbatch.
+        assert executor.stats.backbone_uploads == 4
+        assert executor.stats.body_loads == 4
+
+    def test_one_scoring_lease_at_a_time(self, sources, tokenizer):
+        registry, executor, store, microbatches = make_window(sources, tokenizer, count=1)
+        with executor.scoring_lease(0):
+            with pytest.raises(RuntimeError, match="already active"):
+                with executor.scoring_lease(1):
+                    pass
+            with pytest.raises(RuntimeError, match="one teacher occupies the device at a time"):
+                score_single(executor, registry, microbatches[0], teacher_index=1)
+            with pytest.raises(RuntimeError, match="a scoring lease for teacher index 0 is active"):
+                executor.close()
+        assert executor.stats.live_device_weight_bytes == 0
+        assert executor.stats.backbone_uploads == 1
+
+    @pytest.mark.parametrize("fail_at", [1, 2])
+    def test_failed_scoring_owns_nothing_afterwards(self, monkeypatch, sources, tokenizer, fail_at):
+        registry, executor, store, microbatches = make_window(sources, tokenizer, count=3)
+        plan = store.plan_window(microbatches, target_cache_bytes=1 << 20)
+        scored = {"calls": 0}
+        real_score = executor.score
+
+        class Boom(Exception):
+            pass
+
+        def failing_score(request, writer):
+            scored["calls"] += 1
+            if scored["calls"] == fail_at:
+                raise Boom("scoring failed")
+            return real_score(request, writer)
+
+        monkeypatch.setattr(executor, "score", failing_score)
+        with pytest.raises(Boom):
+            store.score_window(plan, executor, microbatches)
+        # The partially built window owns nothing: no keys, no blocks, no head retentions, no device weights.
+        assert store.live_keys == []
+        assert store._blocks == {} and store._block_refs == {}
+        assert executor._head_refcounts == {} and executor._head_sources == {}
+        assert executor.head_cache.sources == {}
+        assert executor.stats.live_device_weight_bytes == 0
+        store.reset()
+        executor.close()
+        executor.reopen()
+        monkeypatch.setattr(executor, "score", real_score)
+        retry = store.plan_window(microbatches, target_cache_bytes=1 << 20)
+        store.score_window(retry, executor, microbatches)
+        assert store.live_keys == [(0, 0), (0, 1), (0, 2)]
+
+    def test_fingerprint_rejects_equal_shaped_payload_changes(self, sources, tokenizer):
+        registry, executor, store, microbatches = make_window(sources, tokenizer, count=1)
+        plan = store.plan_window(microbatches, target_cache_bytes=1 << 20)
+        store.score_window(plan, executor, microbatches)
+        original = microbatches[0]
+        store.targets_for((0, 0), {**original, "_teacher_targets_key": (0, 0)})  # extra keys are ignored
+
+        token_change = dict(original)
+        token_change["completion_ids"] = original["completion_ids"].clone()
+        token_change["completion_ids"][0, 0] = (token_change["completion_ids"][0, 0] + 1) % (VOCAB_SIZE - 3)
+
+        mask_move = dict(original)
+        moved = original["completion_mask"].clone()
+        moved[1, 0], moved[1, -1] = 0, 1  # same number of valid tokens, different positions
+
+        mask_move["completion_mask"] = moved
+        permuted = {name: value.flip(0) if torch.is_tensor(value) else value for name, value in original.items()}
+        for stale in (token_change, mask_move, permuted):
+            with pytest.raises(RuntimeError, match="does not match the tokens and masks"):
+                store.targets_for((0, 0), stale)
+
     def test_exact_once_consumption(self, sources, tokenizer):
         registry, executor, store, microbatches = make_window(sources, tokenizer, count=1)
         plan = store.plan_window(microbatches, target_cache_bytes=1 << 20)
