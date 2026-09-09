@@ -2284,6 +2284,13 @@ class DistillationTrainer(_BaseTrainer):
 
     def _teacher_manifest(self) -> TeacherManifest:
         """Teacher identities and numerical conventions of this run, as saved next to a student checkpoint."""
+        # A teacher's `hidden_dtype` is the *measured* backbone output dtype and stays unset until it has been scored
+        # once, in which case the manifest falls back to the planned `target_dtype`. Probe the unseen ones so a
+        # manifest written before a teacher was ever routed to, and the one rebuilt on resume, both record the
+        # measured value and `check_compatible` cannot report a difference that is only about observation order.
+        for entry in self._teacher_registry.entries:
+            if entry.hidden_dtype is None:
+                self._teacher_executor.probe_hidden_dtype(entry.index)
         return TeacherManifest.from_registry(
             self._teacher_registry.manifest(),
             student_tokenizer_fingerprint=tokenizer_fingerprint(self._tokenizer),
