@@ -87,7 +87,11 @@ def main():
     per_device_train_batch_size = 1 if args.mode == "ddp" else 2
     training_args = DistillationConfig(
         output_dir=args.output_dir,
-        learning_rate=0.01,
+        learning_rate=0.1,
+        # Plain SGD, so the update is proportional to the gradient: AdamW normalizes by a near-zero second moment
+        # here (the tiny student and teacher start almost identical), which would amplify the last-bit gradient
+        # difference between two ranks and one process into a large parameter difference and tell us nothing.
+        optim="sgd",
         per_device_train_batch_size=per_device_train_batch_size,
         per_device_eval_batch_size=1,
         gradient_accumulation_steps=2,
@@ -118,17 +122,20 @@ def main():
         assert world_size == 2, f"expected world_size == 2 under torchrun, got {world_size}"
         assert torch.distributed.is_initialized(), "torch.distributed was not initialized"
         assert torch.distributed.get_backend() == "gloo", f"expected gloo, got {torch.distributed.get_backend()}"
-        assert str(accelerator.distributed_type) == "MULTI_CPU", f"got {accelerator.distributed_type}"
+        assert accelerator.distributed_type == "MULTI_CPU", f"got {accelerator.distributed_type}"
     else:
         assert world_size == 1, f"the reference must be single-process, got {world_size}"
 
-    # Record which teachers this rank actually routed to, to prove the ranks used disjoint teacher sets.
-    routed = set()
+    # Record which teachers this rank actually routed to during *training*, to prove the ranks trained on disjoint
+    # teacher sets. Evaluation is recorded separately: its sampler shards the evaluation rows differently, and its
+    # deliberately partial last batch is about the metric reduction, not about routing.
+    routed = {"train": set(), "eval": set()}
     generate_and_score = trainer._generate_and_score_completions
 
     def recording_generate_and_score(inputs):
         output = generate_and_score(inputs)
-        routed.update(int(index) for index in output["teacher_index"])
+        mode = "train" if trainer.model.training else "eval"
+        routed[mode].update(int(index) for index in output["teacher_index"])
         return output
 
     trainer._generate_and_score_completions = recording_generate_and_score
@@ -144,7 +151,8 @@ def main():
         "per_device_train_batch_size": per_device_train_batch_size,
         "optimizer_steps": trainer.state.global_step,
         "teacher_ids": trainer._teacher_registry.teacher_ids,
-        "routed_teacher_indices": sorted(routed),
+        "routed_teacher_indices": sorted(routed["train"]),
+        "routed_eval_teacher_indices": sorted(routed["eval"]),
         "train_losses": [entry["loss"] for entry in step_logs],
         "num_tokens": [entry["num_tokens"] for entry in step_logs],
         "teacher_token_frac": [
@@ -168,10 +176,10 @@ def main():
     # Every rank's routing set is needed for the disjointness check, and the collective doubles as a liveness check.
     if world_size > 1:
         gathered = [None] * world_size
-        torch.distributed.all_gather_object(gathered, sorted(routed))
+        torch.distributed.all_gather_object(gathered, sorted(routed["train"]))
         summary["routed_teacher_indices_per_rank"] = gathered
     else:
-        summary["routed_teacher_indices_per_rank"] = [sorted(routed)]
+        summary["routed_teacher_indices_per_rank"] = [sorted(routed["train"])]
 
     trainer.close_teachers()
 
