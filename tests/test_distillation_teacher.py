@@ -21,7 +21,6 @@ import pytest
 import torch
 from tokenizers import Tokenizer, models, pre_tokenizers
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerFast, Qwen3Config, Qwen3ForCausalLM
-
 from transformers.testing_utils import torch_device
 
 from trl.trainer import _distillation_teacher as teacher_module
@@ -67,9 +66,7 @@ def build_tokenizer():
     vocab.update({"<pad>": VOCAB_SIZE - 3, "<eos>": VOCAB_SIZE - 2, "<unk>": VOCAB_SIZE - 1})
     backend = Tokenizer(models.WordLevel(vocab=vocab, unk_token="<unk>"))
     backend.pre_tokenizer = pre_tokenizers.Whitespace()
-    return PreTrainedTokenizerFast(
-        tokenizer_object=backend, pad_token="<pad>", eos_token="<eos>", unk_token="<unk>"
-    )
+    return PreTrainedTokenizerFast(tokenizer_object=backend, pad_token="<pad>", eos_token="<eos>", unk_token="<unk>")
 
 
 def build_model(hidden_size=HIDDEN_SIZE, tie_word_embeddings=False, seed=0):
@@ -113,9 +110,7 @@ def sources(tmp_path_factory, tokenizer):
 
 
 def make_registry(teacher_models, tokenizer, **kwargs):
-    return TeacherRegistry(
-        teacher_models, student_tokenizer=tokenizer, student_vocab_size=VOCAB_SIZE, **kwargs
-    )
+    return TeacherRegistry(teacher_models, student_tokenizer=tokenizer, student_vocab_size=VOCAB_SIZE, **kwargs)
 
 
 def make_executor(registry, **kwargs):
@@ -196,9 +191,7 @@ class TestTeacherRegistry:
 
     def test_unknown_per_teacher_kwargs(self, sources, tokenizer):
         with pytest.raises(ValueError, match="unknown teacher IDs \\['late'\\]"):
-            make_registry(
-                {"early": sources["a"]}, tokenizer, per_teacher_init_kwargs={"late": {"dtype": "float32"}}
-            )
+            make_registry({"early": sources["a"]}, tokenizer, per_teacher_init_kwargs={"late": {"dtype": "float32"}})
 
     def test_preloaded_rejects_per_teacher_kwargs(self, tokenizer):
         model = build_model()
@@ -220,15 +213,11 @@ class TestTeacherRegistry:
 
     def test_local_path_rejects_revision(self, sources, tokenizer):
         with pytest.raises(ValueError, match="Local paths carry no revision"):
-            make_registry(
-                {"early": sources["a"]}, tokenizer, per_teacher_init_kwargs={"early": {"revision": "main"}}
-            )
+            make_registry({"early": sources["a"]}, tokenizer, per_teacher_init_kwargs={"early": {"revision": "main"}})
 
     def test_vocab_size_mismatch(self, sources, tokenizer):
         with pytest.raises(ValueError, match="but the student has vocab_size 8"):
-            TeacherRegistry(
-                {"early": sources["a"]}, student_tokenizer=tokenizer, student_vocab_size=8
-            )
+            TeacherRegistry({"early": sources["a"]}, student_tokenizer=tokenizer, student_vocab_size=8)
 
     def test_tokenizer_mismatch(self, tmp_path, sources, tokenizer):
         mismatched = tmp_path / "repoMismatch"
@@ -249,9 +238,7 @@ class TestTeacherRegistry:
         # Share the student's embedding storage, the aliasing the registry must reject.
         teacher.model.embed_tokens.weight = student.model.embed_tokens.weight
         with pytest.raises(ValueError, match="shares storage with the student"):
-            make_registry(
-                {"live": teacher}, tokenizer, teacher_tokenizers={"live": tokenizer}, student_model=student
-            )
+            make_registry({"live": teacher}, tokenizer, teacher_tokenizers={"live": tokenizer}, student_model=student)
 
     def test_preloaded_independent_copy_accepted(self, tokenizer):
         student = build_model()
@@ -779,9 +766,7 @@ class TestWindowStore:
 
     def test_next_window_starts_where_the_previous_one_ended(self, sources, tokenizer):
         registry, executor, store, microbatches = make_window(sources, tokenizer)
-        first = store.plan_window(
-            microbatches, target_cache_bytes=ROWS_PER_MICROBATCH * BLOCK_BYTES + 4096
-        )
+        first = store.plan_window(microbatches, target_cache_bytes=ROWS_PER_MICROBATCH * BLOCK_BYTES + 4096)
         assert first.microbatch_indices == [0]
         store.score_window(first, executor, microbatches)
         store.release((0, 0))
@@ -802,7 +787,6 @@ class TestWindowStore:
     def test_weight_budget_shrinks_the_window(self, sources, tokenizer):
         """A budget covering one teacher's head plus the largest body admits only single-teacher microbatches."""
         registry = make_registry({"early": sources["a"], "late": sources["a_v2"]}, tokenizer)
-        executor = make_executor(registry)
         store = WindowStore(registry)
         microbatches = [make_microbatch([0, 0], seed=31), make_microbatch([1, 1], seed=32)]
         budget = registry["early"].head_bytes + max(
@@ -866,9 +850,7 @@ class TestWindowStore:
             store.score_window(plan, executor, microbatches)
 
     def test_load_count_follows_teacher_presence(self, sources, tokenizer):
-        registry = make_registry(
-            {"early": sources["a"], "late": sources["a_v2"], "wide": sources["wide"]}, tokenizer
-        )
+        registry = make_registry({"early": sources["a"], "late": sources["a_v2"], "wide": sources["wide"]}, tokenizer)
         executor = make_executor(registry)
         store = WindowStore(registry)
         microbatches = [make_microbatch([0, 1], seed=51), make_microbatch([1, 0], seed=52)]

@@ -1373,7 +1373,7 @@ class WindowStore:
             self._released.discard(key)
         for teacher_index in plan.teacher_indices:
             entry = self.registry.entries[teacher_index]
-            for group, (start, end) in zip(plan.groups, ranges):
+            for group, (start, end) in zip(plan.groups, ranges, strict=True):
                 if group.teacher_index != teacher_index:
                     continue
                 microbatch = inputs[group.microbatch_index]
@@ -1481,16 +1481,12 @@ class WindowStore:
             entry = self.registry.entries[teacher_index]
             positions = (flat & (row_teacher == teacher_index)).nonzero().flatten()
             if positions.numel() > 0:
-                groups.append(
-                    _PlannedGroup(index, teacher_index, positions, (entry.hidden_size, entry.hidden_dtype))
-                )
+                groups.append(_PlannedGroup(index, teacher_index, positions, (entry.hidden_size, entry.hidden_dtype)))
         return groups
 
     def _target_bytes(self, groups: list[_PlannedGroup]) -> int:
         block_keys = {group.block_key for group in groups}
-        rows = sum(
-            group.positions.numel() * group.block_key[0] * _dtype_bytes(group.block_key[1]) for group in groups
-        )
+        rows = sum(group.positions.numel() * group.block_key[0] * _dtype_bytes(group.block_key[1]) for group in groups)
         return rows + len(block_keys) * _TARGET_BLOCK_OVERHEAD_BYTES
 
     def _weight_bytes(self, groups: list[_PlannedGroup]) -> int:
