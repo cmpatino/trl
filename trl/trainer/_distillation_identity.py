@@ -66,7 +66,9 @@ def canonical_tokenizer_payload(tokenizer) -> dict:
         "sep": (tokenizer.sep_token, tokenizer.sep_token_id),
         "cls": (tokenizer.cls_token, tokenizer.cls_token_id),
         "mask": (tokenizer.mask_token, tokenizer.mask_token_id),
-        "additional_special_tokens": list(zip(tokenizer.extra_special_tokens, tokenizer.extra_special_tokens_ids)),
+        "additional_special_tokens": list(
+            zip(tokenizer.extra_special_tokens, tokenizer.extra_special_tokens_ids, strict=True)
+        ),
     }
     payload["model_input_names"] = tokenizer.model_input_names
     return payload
@@ -256,7 +258,7 @@ class TeacherManifest:
             differences.append(f"teacher ids/order: {self_ids!r} != {other_ids!r}")
         else:
             per_teacher_keys = _TEACHER_ENTRY_KEYS[2:] + _TEACHER_DTYPE_KEYS  # skip id/index, already compared above
-            for self_teacher, other_teacher in zip(self.teachers, other.teachers):
+            for self_teacher, other_teacher in zip(self.teachers, other.teachers, strict=True):
                 for key in per_teacher_keys:
                     if self_teacher[key] != other_teacher[key]:
                         differences.append(
