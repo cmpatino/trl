@@ -742,6 +742,21 @@ class TestWindowStore:
         with pytest.raises(RuntimeError, match="no scored targets for \\(0, 2\\)"):
             store.targets_for((0, 2))
 
+    def test_next_window_starts_where_the_previous_one_ended(self, sources, tokenizer):
+        registry, executor, store, microbatches = make_window(sources, tokenizer)
+        first = store.plan_window(
+            microbatches, target_cache_bytes=ROWS_PER_MICROBATCH * BLOCK_BYTES + 4096
+        )
+        assert first.microbatch_indices == [0]
+        store.score_window(first, executor, microbatches)
+        store.release((0, 0))
+        second = store.plan_window(microbatches, target_cache_bytes=1 << 20, start_index=1)
+        assert second.microbatch_indices == [1, 2]
+        store.score_window(second, executor, microbatches)
+        assert [group.teacher_index for group in store.targets_for((0, 2), microbatches[2])] == [0, 1]
+        with pytest.raises(ValueError, match="Microbatch 2 of generation batch 0 needs"):
+            store.plan_window(microbatches, target_cache_bytes=10, start_index=2)
+
     def test_over_budget_microbatch_names_the_control(self, sources, tokenizer):
         registry, executor, store, microbatches = make_window(sources, tokenizer)
         with pytest.raises(ValueError, match="needs 4256 bytes but `teacher_target_cache_bytes` is 100"):

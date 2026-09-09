@@ -1269,6 +1269,7 @@ class WindowStore:
         target_cache_bytes: int,
         cpu_weight_budget_bytes: int | None = None,
         generation_id: int = 0,
+        start_index: int = 0,
     ) -> WindowPlan:
         """
         Choose the largest prefix of whole microbatches whose targets and teacher weights fit the budgets.
@@ -1285,17 +1286,20 @@ class WindowStore:
                 (`teacher_cpu_weight_budget_bytes`).
             generation_id (`int`, *optional*, defaults to `0`):
                 ID of the generation batch these microbatches come from; part of every target key.
+            start_index (`int`, *optional*, defaults to `0`):
+                First microbatch of this window. Pass the full generation batch and the index the previous window
+                ended at to plan the next window; `microbatch_index` stays absolute in every target key.
 
         Returns:
             [`WindowPlan`]: the planned window.
         """
         groups: list[_PlannedGroup] = []
-        per_microbatch: list[list[_PlannedGroup]] = []
-        for index, microbatch in enumerate(microbatches):
-            per_microbatch.append(self._microbatch_groups(microbatch, index))
+        per_microbatch = [
+            self._microbatch_groups(microbatches[index], index) for index in range(start_index, len(microbatches))
+        ]
         best = 0
         best_bytes = (0, 0)
-        for count in range(1, len(microbatches) + 1):
+        for count in range(1, len(per_microbatch) + 1):
             window = [group for entry in per_microbatch[:count] for group in entry]
             target_bytes = self._target_bytes(window)
             weight_bytes = self._weight_bytes(window)
@@ -1309,9 +1313,9 @@ class WindowStore:
                         else ("teacher_cpu_weight_budget_bytes", weight_bytes, cpu_weight_budget_bytes)
                     )
                     raise ValueError(
-                        f"Microbatch 0 of generation batch {generation_id} needs {required} bytes but `{control}` is "
-                        f"{budget}. Raise `{control}`, or lower the per-device batch size / completion length; the "
-                        "objective is never truncated to make a microbatch fit."
+                        f"Microbatch {start_index} of generation batch {generation_id} needs {required} bytes but "
+                        f"`{control}` is {budget}. Raise `{control}`, or lower the per-device batch size / "
+                        "completion length; the objective is never truncated to make a microbatch fit."
                     )
                 break
             best, best_bytes = count, (target_bytes, weight_bytes)
@@ -1322,7 +1326,7 @@ class WindowStore:
             block_rows[group.block_key] = block_rows.get(group.block_key, 0) + group.positions.numel()
         plan = WindowPlan(
             generation_id=generation_id,
-            microbatch_indices=list(range(best)),
+            microbatch_indices=list(range(start_index, start_index + best)),
             groups=groups,
             block_rows=block_rows,
             teacher_indices=teacher_indices,
@@ -1330,9 +1334,10 @@ class WindowStore:
             weight_bytes=best_bytes[1],
         )
         logger.info(
-            "Planned teacher scoring window: %d/%d microbatches, %d target bytes in %d block(s), %d host weight "
-            "bytes, %d teacher load(s) for teachers %s",
-            best,
+            "Planned teacher scoring window: microbatches %d-%d of %d, %d target bytes in %d block(s), %d host "
+            "weight bytes, %d teacher load(s) for teachers %s",
+            start_index,
+            start_index + best - 1,
             len(microbatches),
             plan.target_bytes,
             len(block_rows),
