@@ -19,11 +19,13 @@ from pathlib import Path
 
 import pytest
 import torch
+from safetensors.torch import load_file, save_file
 from tokenizers import Tokenizer, models, pre_tokenizers
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerFast, Qwen3Config, Qwen3ForCausalLM
 from transformers.testing_utils import torch_device
 
 from trl.trainer import _distillation_teacher as teacher_module
+from trl.trainer._distillation_heads import TeacherHeadCache
 from trl.trainer._distillation_identity import TeacherManifest, tokenizer_fingerprint
 from trl.trainer._distillation_teacher import (
     HiddenTargetBlock,
@@ -31,6 +33,7 @@ from trl.trainer._distillation_teacher import (
     TeacherExecutor,
     TeacherRegistry,
     WindowStore,
+    _checkpoint_inventory,
     _resolve_hub_snapshot,
 )
 
@@ -90,6 +93,24 @@ def save_source(directory, tokenizer, **kwargs):
     model.save_pretrained(directory)
     tokenizer.save_pretrained(directory)
     return str(directory)
+
+
+def overwrite_weights(directory, tensor_name="model.embed_tokens.weight", value=0.5):
+    """Replace one tensor's values in place, keeping its shape, dtype, the file size and `config.json` identical."""
+    path = Path(directory) / "model.safetensors"
+    tensors = load_file(str(path))
+    tensors[tensor_name] = torch.full_like(tensors[tensor_name], value)
+    save_file(tensors, str(path), metadata={"format": "pt"})
+
+
+def manifest_of(registry, tokenizer):
+    return TeacherManifest.from_registry(
+        registry.manifest(),
+        student_tokenizer_fingerprint=tokenizer_fingerprint(tokenizer),
+        beta=1.0,
+        temperature=1.0,
+        chunk_size=256,
+    )
 
 
 @pytest.fixture(scope="module")
@@ -167,7 +188,7 @@ def score_single(executor, registry, microbatch, teacher_index=0, hidden_size=HI
     positions = (loss_mask.reshape(-1) > 0).nonzero().flatten()
     entry = registry.entries[teacher_index]
     block = HiddenTargetBlock(
-        1, torch.zeros((positions.numel(), hidden_size), dtype=entry.hidden_dtype), [None] * positions.numel()
+        1, torch.zeros((positions.numel(), hidden_size), dtype=entry.target_dtype), [None] * positions.numel()
     )
     request = ScoreRequest(
         generation_id=0,
@@ -296,8 +317,12 @@ class TestTeacherRegistry:
             "vocab_size",
             "source_dtype",
             "hidden_dtype",
+            "hidden_dtype_observed",
+            "target_dtype",
             "projection_dtype",
             "adapter_version",
+            "content_digest",
+            "content_hashed_bytes",
             "head",
             "evictable",
             "storage_bytes",
@@ -306,6 +331,10 @@ class TestTeacherRegistry:
         assert set(teacher) == expected
         # `TeacherManifest.from_registry` serializes these itself, so they stay native here.
         assert teacher["source_dtype"] == torch.float32
+        # No forward has run, so the reported hidden dtype is still the planned target dtype, flagged as such.
+        assert teacher["hidden_dtype_observed"] is False
+        assert teacher["hidden_dtype"] == teacher["target_dtype"] == torch.float32
+        assert teacher["content_hashed_bytes"] > 0
         assert teacher["head"] == {
             "weight_shape": (VOCAB_SIZE, HIDDEN_SIZE),
             "has_bias": False,
@@ -438,9 +467,29 @@ class TestTeacherExecutor:
     def test_capabilities_and_precision_records(self, sources, tokenizer):
         registry = make_registry({"early": sources["a"]}, tokenizer)
         executor = make_executor(registry)
+        entry = registry["early"]
         assert executor.capabilities == {"hidden_targets": True, "requires_collective_schedule": False}
-        assert registry["early"].hidden_dtype == torch.float32
-        assert registry["early"].projection_dtype == torch.float32
+        assert (entry.source_dtype, entry.target_dtype, entry.projection_dtype) == (
+            torch.float32,
+            torch.float32,
+            torch.float32,
+        )
+        # The backbone output dtype is measured, never taken from the configuration.
+        assert entry.hidden_dtype is None
+        assert executor.probe_hidden_dtype(0) == torch.float32
+        assert entry.hidden_dtype == torch.float32
+
+    def test_hidden_dtype_is_observed_at_first_scoring(self, sources, tokenizer):
+        registry = make_registry({"early": sources["a"]}, tokenizer)
+        executor = make_executor(registry)
+        entry = registry["early"]
+        assert entry.hidden_dtype is None
+        _, _, result = score_single(executor, registry, make_microbatch([0]))
+        assert entry.hidden_dtype == torch.float32
+        assert result.hidden_dtype == torch.float32
+        manifest = registry.manifest()["teachers"][0]
+        assert manifest["hidden_dtype_observed"] is True
+        assert manifest["hidden_dtype"] == torch.float32
 
     def test_evict_idle_gpu_delegates_to_the_head_cache(self, sources, tokenizer):
         registry = make_registry({"early": sources["a"]}, tokenizer)
@@ -493,11 +542,14 @@ class TestTeacherExecutor:
         registry = make_registry({"early": sources["a"]}, tokenizer)
         executor = make_executor(registry, autocast_dtype=torch.bfloat16)
         entry = registry["early"]
-        assert entry.hidden_dtype == torch.bfloat16 and entry.projection_dtype == torch.bfloat16
+        assert entry.target_dtype == torch.bfloat16 and entry.projection_dtype == torch.bfloat16
         assert entry.source_dtype == torch.float32  # the CPU source keeps its own dtype
         microbatch = make_microbatch([0])
         block, positions, result = score_single(executor, registry, microbatch)
-        assert block.hidden.dtype == torch.bfloat16 and result.hidden_dtype == torch.bfloat16
+        # Targets are stored in the target dtype; the observed backbone output dtype is recorded separately.
+        assert block.hidden.dtype == torch.bfloat16
+        assert result.hidden_dtype == entry.hidden_dtype
+        assert entry.hidden_dtype is not None
         model = AutoModelForCausalLM.from_pretrained(sources["a"], dtype=torch.float32)
         model.eval()
         input_ids = torch.cat([microbatch["prompt_ids"], microbatch["completion_ids"]], dim=1)
@@ -881,6 +933,88 @@ class TestWindowStore:
         }
         with pytest.raises(ValueError, match="has no rows"):
             store.plan_window([empty], target_cache_bytes=1 << 20)
+
+
+class TestRealHeadCacheSeam:
+    """One test wiring W1's real `TeacherHeadCache` instead of the fake, to check the retention seam end to end."""
+
+    def test_retained_source_projects_through_a_real_lease(self, sources, tokenizer):
+        registry = make_registry({"early": sources["a"]}, tokenizer)
+        cache = TeacherHeadCache(torch.device("cpu"))
+        executor = TeacherExecutor(registry, cache, torch.device("cpu"), scoring_batch_size=1)
+        microbatch = make_microbatch([0])
+        block, positions, _ = score_single(executor, registry, microbatch)
+        identity = registry["early"].head_identity
+        executor.retain_head_source(0)
+        with cache.projection_lease(identity, torch.float32) as head:
+            logits = block.hidden @ head.weight.t()
+        _, reference_logits = reference_forward(sources["a"], microbatch)
+        torch.testing.assert_close(logits, reference_logits[positions], rtol=1e-5, atol=1e-6)
+        assert cache.stats.uploads == 1
+        cache.evict_idle_gpu()
+        executor.release_head_source(0)
+        executor.close()
+        cache.close()
+
+
+class TestSourceContentIdentity:
+    """A source's identity must follow its tensor values: local paths are mutable and model objects have no files."""
+
+    def test_local_weight_replacement_changes_identity(self, tmp_path, tokenizer):
+        mutable = str(tmp_path / "repoMutable")
+        save_source(mutable, tokenizer, seed=5)
+        before = _checkpoint_inventory(mutable)
+        registry = make_registry({"mutable": mutable}, tokenizer)
+        overwrite_weights(mutable)
+        after = _checkpoint_inventory(mutable)
+        # Shapes, dtypes, file sizes and the config are untouched: only the values moved.
+        assert after["tensors"] == before["tensors"]
+        assert [entry[:2] for entry in after["files"]] == [entry[:2] for entry in before["files"]]
+        assert after["config_digest"] == before["config_digest"]
+        assert after["content_digest"] != before["content_digest"]
+        assert make_registry({"mutable": mutable}, tokenizer)["mutable"].source_key != registry["mutable"].source_key
+
+    def test_mutated_checkpoint_is_rejected_before_scoring(self, tmp_path, sources, tokenizer):
+        mutable = str(tmp_path / "repoMutable")
+        save_source(mutable, tokenizer, seed=5)
+        registry = make_registry({"mutable": mutable, "other": sources["a_v2"]}, tokenizer)
+        executor = make_executor(registry)
+        score_single(executor, registry, make_microbatch([0]), teacher_index=0)
+        head = executor.retain_head_source(0)
+        overwrite_weights(mutable)
+        executor._load_body(1)  # evict the pinned body, so the next use has to reload from disk
+        with pytest.raises(ValueError, match="changed since registration"):
+            score_single(executor, registry, make_microbatch([0]), teacher_index=0)
+        assert executor.stats.verify_bytes > 0
+        # The reload never happened, so the retained head still belongs to the registered content.
+        assert head.identity is registry["mutable"].head_identity
+        assert executor.stats.body_loads == 2
+
+    def test_mutated_checkpoint_fails_manifest_compatibility(self, tmp_path, sources, tokenizer):
+        mutable = str(tmp_path / "repoMutable")
+        save_source(mutable, tokenizer, seed=5)
+        teachers = {"mutable": mutable, "other": sources["a_v2"]}
+        registered = manifest_of(make_registry(teachers, tokenizer), tokenizer)
+        overwrite_weights(mutable)
+        mutated = manifest_of(make_registry(teachers, tokenizer), tokenizer)
+        with pytest.raises(ValueError):
+            registered.check_compatible(mutated)
+
+    def test_preloaded_identity_follows_parameter_values(self, tokenizer):
+        registries = {
+            name: make_registry({"live": build_model(seed=seed)}, tokenizer, teacher_tokenizers={"live": tokenizer})
+            for name, seed in (("first", 9), ("same", 9), ("other", 10))
+        }
+        first, same, other = (registries[name]["live"] for name in ("first", "same", "other"))
+        assert first.content_hashed_bytes > 0
+        # A different object with identical values stays the same source; different values do not.
+        assert first.content_digest == same.content_digest
+        assert first.source_key == same.source_key
+        assert first.content_digest != other.content_digest
+        assert first.source_key != other.source_key
+        manifest_of(registries["first"], tokenizer).check_compatible(manifest_of(registries["same"], tokenizer))
+        with pytest.raises(ValueError):
+            manifest_of(registries["first"], tokenizer).check_compatible(manifest_of(registries["other"], tokenizer))
 
 
 @require_torch_accelerator
