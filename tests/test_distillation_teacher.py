@@ -936,6 +936,36 @@ class TestWindowStore:
         store.score_window(retry, executor, microbatches)
         assert store.live_keys == [(0, 0), (0, 1), (0, 2)]
 
+    @pytest.mark.parametrize("fail_at", [1, 2])
+    def test_failed_window_preparation_owns_nothing(self, monkeypatch, sources, tokenizer, fail_at):
+        """Preparation shares the scoring rollback: a host failure while fingerprinting must leave no key behind."""
+        registry, executor, store, microbatches = make_window(sources, tokenizer, count=2)
+        plan = store.plan_window(microbatches, target_cache_bytes=1 << 20)
+        real_fingerprint = teacher_module._microbatch_fingerprint
+        calls = {"count": 0}
+
+        def failing_fingerprint(microbatch, generation_id, microbatch_index):
+            calls["count"] += 1
+            if calls["count"] == fail_at:
+                raise MemoryError("host copy failed")
+            return real_fingerprint(microbatch, generation_id, microbatch_index)
+
+        monkeypatch.setattr(teacher_module, "_microbatch_fingerprint", failing_fingerprint)
+        with pytest.raises(MemoryError):
+            store.score_window(plan, executor, microbatches)
+        assert store.live_keys == []
+        assert store._blocks == {} and store._block_refs == {}
+        assert store._consumers == {} and store._fingerprints == {}
+        assert executor._head_refcounts == {} and executor.head_cache.sources == {}
+        # Cleanup must not raise over the original failure, and the store must be reusable afterwards.
+        store.reset()
+        executor.close()
+        executor.reopen()
+        monkeypatch.setattr(teacher_module, "_microbatch_fingerprint", real_fingerprint)
+        retry = store.plan_window(microbatches, target_cache_bytes=1 << 20)
+        store.score_window(retry, executor, microbatches)
+        assert store.live_keys == [(0, 0), (0, 1)]
+
     def test_fingerprint_rejects_equal_shaped_payload_changes(self, sources, tokenizer):
         registry, executor, store, microbatches = make_window(sources, tokenizer, count=1)
         plan = store.plan_window(microbatches, target_cache_bytes=1 << 20)
