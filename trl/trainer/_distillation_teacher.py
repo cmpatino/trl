@@ -27,7 +27,7 @@ import logging
 import os
 import struct
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -826,8 +826,13 @@ class ScoreResult:
 
 @dataclass
 class ExecutorStats:
-    """Performance counters of the scoring executor; `device` counters are the disposable scoring copies."""
+    """Performance counters of the scoring executor; `device` counters cover the disposable scoring copies.
 
+    `body_loads` counts CPU body materializations and `cpu_reloads` the subset that re-materialized a previously
+    evicted source.
+    """
+
+    body_loads: int = 0
     cpu_reloads: int = 0
     disk_bytes: int = 0
     backbone_uploads: int = 0
@@ -1109,6 +1114,7 @@ class TeacherExecutor:
         model.requires_grad_(False)
         self._body = model
         self._body_key = entry.source_key
+        self.stats.body_loads += 1
         self.stats.disk_bytes += entry.storage_bytes
         if entry.source_key in self._loaded_keys:
             self.stats.cpu_reloads += 1
@@ -1201,3 +1207,334 @@ class TeacherExecutor:
     def _account_cpu(self) -> None:
         self.stats.live_cpu_weight_bytes = self._live_cpu_bytes()
         self.stats.peak_cpu_weight_bytes = max(self.stats.peak_cpu_weight_bytes, self.stats.live_cpu_weight_bytes)
+
+
+@dataclass(frozen=True)
+class _PlannedGroup:
+    """One teacher's requested target rows inside one microbatch of the planned window."""
+
+    microbatch_index: int
+    teacher_index: int
+    positions: torch.Tensor
+    block_key: tuple
+
+
+@dataclass
+class WindowPlan:
+    """A consecutive window of whole microbatches that fits the CPU target and host weight budgets."""
+
+    generation_id: int
+    microbatch_indices: list[int]
+    groups: list[_PlannedGroup]
+    block_rows: dict[tuple, int]
+    teacher_indices: list[int]
+    target_bytes: int
+    weight_bytes: int
+
+
+class WindowStore:
+    """
+    Owns the CPU hidden targets of the current scoring window, keyed by `(generation_id, microbatch_index)`.
+
+    A window is a prefix of whole microbatches of the current generation batch: planning never splits a microbatch or
+    truncates the objective, it only shrinks the window. Targets of one width and dtype share one contiguous block, so
+    each [`TargetGroup`] is a zero-copy row slice; a block and the head sources it needs are released after the last
+    consuming microbatch finishes. Consumption is exact-once: a released key cannot be read again, and the token/mask
+    fingerprint recorded at scoring time must match the microbatch presented for training.
+
+    Args:
+        registry ([`TeacherRegistry`]):
+            Registry the planned teacher indices refer to. The executor must already have recorded its precision
+            policy on the entries (it does so at construction), because planning sizes blocks in `hidden_dtype`.
+    """
+
+    def __init__(self, registry: TeacherRegistry):
+        self.registry = registry
+        self._executor: TeacherExecutor | None = None
+        self._blocks: dict[int, HiddenTargetBlock] = {}
+        self._block_refs: dict[int, int] = {}
+        self._targets: dict[tuple[int, int], list[TargetGroup]] = {}
+        self._key_blocks: dict[tuple[int, int], list[int]] = {}
+        self._key_teachers: dict[tuple[int, int], list[int]] = {}
+        self._consumers: dict[tuple[int, int], int] = {}
+        self._fingerprints: dict[tuple[int, int], tuple] = {}
+        self._released: set[tuple[int, int]] = set()
+        self._next_block_id = 0
+
+    def plan_window(
+        self,
+        microbatches: list[dict],
+        *,
+        target_cache_bytes: int,
+        cpu_weight_budget_bytes: int | None = None,
+        generation_id: int = 0,
+    ) -> WindowPlan:
+        """
+        Choose the largest prefix of whole microbatches whose targets and teacher weights fit the budgets.
+
+        Args:
+            microbatches (`list[dict]`):
+                The split microbatch dicts, in consumption order. Each needs `completion_mask`, a per-row
+                `teacher_index` (registry indices, as returned by [`~TeacherRegistry.resolve_ids`]) and optionally
+                `tool_mask`; masked positions stay in the input context but get no target.
+            target_cache_bytes (`int`):
+                Per-rank CPU target allocation limit (`teacher_target_cache_bytes`).
+            cpu_weight_budget_bytes (`int`, *optional*):
+                Cap on retained head sources, non-evictable models and the largest body plus its loading transient
+                (`teacher_cpu_weight_budget_bytes`).
+            generation_id (`int`, *optional*, defaults to `0`):
+                ID of the generation batch these microbatches come from; part of every target key.
+
+        Returns:
+            [`WindowPlan`]: the planned window.
+        """
+        groups: list[_PlannedGroup] = []
+        per_microbatch: list[list[_PlannedGroup]] = []
+        for index, microbatch in enumerate(microbatches):
+            per_microbatch.append(self._microbatch_groups(microbatch, index))
+        best = 0
+        best_bytes = (0, 0)
+        for count in range(1, len(microbatches) + 1):
+            window = [group for entry in per_microbatch[:count] for group in entry]
+            target_bytes = self._target_bytes(window)
+            weight_bytes = self._weight_bytes(window)
+            if target_bytes > target_cache_bytes or (
+                cpu_weight_budget_bytes is not None and weight_bytes > cpu_weight_budget_bytes
+            ):
+                if count == 1:
+                    control, required, budget = (
+                        ("teacher_target_cache_bytes", target_bytes, target_cache_bytes)
+                        if target_bytes > target_cache_bytes
+                        else ("teacher_cpu_weight_budget_bytes", weight_bytes, cpu_weight_budget_bytes)
+                    )
+                    raise ValueError(
+                        f"Microbatch 0 of generation batch {generation_id} needs {required} bytes but `{control}` is "
+                        f"{budget}. Raise `{control}`, or lower the per-device batch size / completion length; the "
+                        "objective is never truncated to make a microbatch fit."
+                    )
+                break
+            best, best_bytes = count, (target_bytes, weight_bytes)
+            groups = window
+        teacher_indices = sorted({group.teacher_index for group in groups})
+        block_rows: dict[tuple, int] = {}
+        for group in groups:
+            block_rows[group.block_key] = block_rows.get(group.block_key, 0) + group.positions.numel()
+        plan = WindowPlan(
+            generation_id=generation_id,
+            microbatch_indices=list(range(best)),
+            groups=groups,
+            block_rows=block_rows,
+            teacher_indices=teacher_indices,
+            target_bytes=best_bytes[0],
+            weight_bytes=best_bytes[1],
+        )
+        logger.info(
+            "Planned teacher scoring window: %d/%d microbatches, %d target bytes in %d block(s), %d host weight "
+            "bytes, %d teacher load(s) for teachers %s",
+            best,
+            len(microbatches),
+            plan.target_bytes,
+            len(block_rows),
+            plan.weight_bytes,
+            len(teacher_indices),
+            [self.registry.entries[index].teacher_id for index in teacher_indices],
+        )
+        return plan
+
+    def score_window(self, plan: WindowPlan, executor: TeacherExecutor, inputs: list[dict]) -> None:
+        """
+        Fill the window's target blocks, loading one teacher at a time and releasing its device weights after its rows.
+
+        Args:
+            plan ([`WindowPlan`]):
+                Plan returned by [`~WindowStore.plan_window`].
+            executor ([`TeacherExecutor`]):
+                Executor scoring the rows and retaining the head sources.
+            inputs (`list[dict]`):
+                The same microbatch dicts that were planned, indexable by `microbatch_index`. Each needs
+                `prompt_ids`, `prompt_mask`, `completion_ids`, `completion_mask`, a per-row `teacher_index` and
+                optionally `tool_mask` and `sample_ids`.
+        """
+        self._executor = executor
+        keys = [(plan.generation_id, index) for index in plan.microbatch_indices]
+        live = [key for key in keys if key in self._targets]
+        if live:
+            raise RuntimeError(
+                f"target keys {live} are still live; release the previous window (or call `reset()`) before scoring a "
+                "new one"
+            )
+        blocks = {}
+        for block_key, rows in plan.block_rows.items():
+            width, dtype = block_key
+            self._next_block_id += 1
+            block = HiddenTargetBlock(self._next_block_id, torch.zeros((rows, width), dtype=dtype), [None] * rows)
+            blocks[block_key] = block
+            self._blocks[block.block_id] = block
+            self._block_refs[block.block_id] = 0
+        offsets = dict.fromkeys(plan.block_rows, 0)
+        ranges = []
+        for group in plan.groups:
+            start = offsets[group.block_key]
+            offsets[group.block_key] = start + group.positions.numel()
+            ranges.append((start, offsets[group.block_key]))
+        for key in keys:
+            self._targets[key] = []
+            self._key_blocks[key] = []
+            self._key_teachers[key] = []
+            self._consumers[key] = 1
+            self._fingerprints[key] = _microbatch_fingerprint(inputs[key[1]])
+            self._released.discard(key)
+        for teacher_index in plan.teacher_indices:
+            entry = self.registry.entries[teacher_index]
+            for group, (start, end) in zip(plan.groups, ranges):
+                if group.teacher_index != teacher_index:
+                    continue
+                microbatch = inputs[group.microbatch_index]
+                block = blocks[group.block_key]
+                key = (plan.generation_id, group.microbatch_index)
+                executor.retain_head_source(teacher_index)
+                completion_length = microbatch["completion_ids"].shape[1]
+                sample_ids = _sample_ids(microbatch, plan.generation_id, group.microbatch_index)
+                request = ScoreRequest(
+                    generation_id=plan.generation_id,
+                    microbatch_index=group.microbatch_index,
+                    teacher_index=teacher_index,
+                    input_ids=torch.cat([microbatch["prompt_ids"], microbatch["completion_ids"]], dim=1),
+                    attention_mask=torch.cat([microbatch["prompt_mask"], microbatch["completion_mask"]], dim=1),
+                    prompt_length=microbatch["prompt_ids"].shape[1],
+                    completion_length=completion_length,
+                    positions=group.positions,
+                    sample_ids=sample_ids,
+                )
+                writer = executor.target_writer(block, torch.arange(start, end))
+                executor.score(request, writer)
+                for row, position in enumerate(group.positions.tolist()):
+                    block.row_samples[start + row] = (
+                        sample_ids[position // completion_length],
+                        position % completion_length,
+                    )
+                self._targets[key].append(
+                    TargetGroup(
+                        identity=entry.head_identity,
+                        teacher_index=teacher_index,
+                        hidden=block.hidden[start:end],
+                        positions=group.positions,
+                    )
+                )
+                self._key_blocks[key].append(block.block_id)
+                self._key_teachers[key].append(teacher_index)
+                self._block_refs[block.block_id] += 1
+
+    def targets_for(self, key: tuple[int, int], microbatch: dict | None = None) -> list[TargetGroup]:
+        """
+        Return the target groups of one microbatch as zero-copy views.
+
+        Args:
+            key (`tuple[int, int]`):
+                `(generation_id, microbatch_index)`.
+            microbatch (`dict`, *optional*):
+                The microbatch about to be trained on. When given, its token/mask fingerprint must match the one
+                recorded at scoring time.
+
+        Returns:
+            `list[TargetGroup]`: one group per teacher present in the microbatch, ordered by registry index.
+        """
+        if key in self._released:
+            raise RuntimeError(f"targets for {key} were already released; each microbatch consumes its targets once")
+        if key not in self._targets:
+            raise RuntimeError(f"no scored targets for {key}; live keys are {sorted(self._targets)}")
+        if microbatch is not None and _microbatch_fingerprint(microbatch) != self._fingerprints[key]:
+            raise RuntimeError(
+                f"the microbatch presented for {key} does not match the tokens and masks its targets were scored for"
+            )
+        return self._targets[key]
+
+    def release(self, key: tuple[int, int]) -> None:
+        """Drop one consumer of `key`; the last one frees its block rows and head-source retentions."""
+        if key not in self._consumers:
+            raise RuntimeError(f"no scored targets for {key}; live keys are {sorted(self._targets)}")
+        self._consumers[key] -= 1
+        if self._consumers[key] > 0:
+            return
+        self._free_key(key)
+        self._released.add(key)
+
+    def reset(self) -> None:
+        """Drop every window: used when the generation buffer is renewed or training resumes from a checkpoint."""
+        for key in list(self._consumers):
+            self._free_key(key)
+        self._released.clear()
+        self._blocks.clear()
+        self._block_refs.clear()
+
+    def _free_key(self, key: tuple[int, int]) -> None:
+        for teacher_index in self._key_teachers.pop(key):
+            self._executor.release_head_source(teacher_index)
+        for block_id in self._key_blocks.pop(key):
+            self._block_refs[block_id] -= 1
+            if self._block_refs[block_id] == 0:
+                self._blocks.pop(block_id)
+                self._block_refs.pop(block_id)
+        self._targets.pop(key)
+        self._consumers.pop(key)
+        self._fingerprints.pop(key)
+
+    def _microbatch_groups(self, microbatch: dict, index: int) -> list[_PlannedGroup]:
+        loss_mask = _loss_mask(microbatch)
+        if loss_mask.shape[0] == 0:
+            raise ValueError(
+                f"microbatch {index} has no rows; managed multi-teacher distillation requires nonempty scheduled "
+                "microbatches"
+            )
+        completion_length = loss_mask.shape[1]
+        row_teacher = microbatch["teacher_index"].repeat_interleave(completion_length)
+        flat = loss_mask.reshape(-1) > 0
+        groups = []
+        for teacher_index in sorted(set(microbatch["teacher_index"].tolist())):
+            entry = self.registry.entries[teacher_index]
+            positions = (flat & (row_teacher == teacher_index)).nonzero().flatten()
+            if positions.numel() > 0:
+                groups.append(
+                    _PlannedGroup(index, teacher_index, positions, (entry.hidden_size, entry.hidden_dtype))
+                )
+        return groups
+
+    def _target_bytes(self, groups: list[_PlannedGroup]) -> int:
+        block_keys = {group.block_key for group in groups}
+        rows = sum(
+            group.positions.numel() * group.block_key[0] * _dtype_bytes(group.block_key[1]) for group in groups
+        )
+        return rows + len(block_keys) * _TARGET_BLOCK_OVERHEAD_BYTES
+
+    def _weight_bytes(self, groups: list[_PlannedGroup]) -> int:
+        """Host weight bytes the window needs: retained heads, non-evictable models and the largest body it loads."""
+        present = {group.teacher_index for group in groups}
+        entries = [self.registry.entries[index] for index in present]
+        heads = sum(entry.head_bytes for entry in entries)
+        non_evictable = sum(entry.storage_bytes for entry in self.registry.entries if not entry.evictable)
+        bodies = [entry.storage_bytes + entry.loading_transient_bytes for entry in entries if entry.evictable]
+        return heads + non_evictable + (max(bodies) if bodies else 0)
+
+
+def _loss_mask(microbatch: dict) -> torch.Tensor:
+    """Completion mask restricted to the positions the loss trains on, matching `DistillationTrainer._compute_loss`."""
+    completion_mask = microbatch["completion_mask"]
+    return completion_mask if "tool_mask" not in microbatch else completion_mask * microbatch["tool_mask"]
+
+
+def _microbatch_fingerprint(microbatch: dict) -> tuple:
+    """Token/mask shapes and content summary validated before targets are consumed."""
+    loss_mask = _loss_mask(microbatch)
+    return (
+        tuple(microbatch["prompt_ids"].shape),
+        tuple(microbatch["completion_ids"].shape),
+        int(loss_mask.sum()),
+        tuple(int(index) for index in microbatch["teacher_index"]),
+    )
+
+
+def _sample_ids(microbatch: dict, generation_id: int, microbatch_index: int) -> tuple:
+    """Stable per-row IDs; synthesized from the window key when the generation payload carries none."""
+    if "sample_ids" in microbatch:
+        return tuple(microbatch["sample_ids"])
+    return tuple(f"{generation_id}:{microbatch_index}:{row}" for row in range(microbatch["completion_ids"].shape[0]))
