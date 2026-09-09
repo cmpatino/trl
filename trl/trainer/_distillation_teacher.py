@@ -826,7 +826,8 @@ class ScoreResult:
 
 @dataclass
 class ExecutorStats:
-    """Performance counters of the scoring executor; `device` counters cover the disposable scoring copies.
+    """
+    Performance counters of the scoring executor; the `device` counters cover the disposable scoring copies.
 
     `body_loads` counts CPU body materializations and `cpu_reloads` the subset that re-materialized a previously
     evicted source.

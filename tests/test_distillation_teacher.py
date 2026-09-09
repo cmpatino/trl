@@ -22,6 +22,8 @@ import torch
 from tokenizers import Tokenizer, models, pre_tokenizers
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerFast, Qwen3Config, Qwen3ForCausalLM
 
+from transformers.testing_utils import torch_device
+
 from trl.trainer import _distillation_teacher as teacher_module
 from trl.trainer._distillation_teacher import (
     HiddenTargetBlock,
@@ -32,6 +34,8 @@ from trl.trainer._distillation_teacher import (
     _resolve_hub_snapshot,
     _tokenizer_fingerprint,
 )
+
+from .testing_utils import require_torch_accelerator
 
 
 VOCAB_SIZE = 64
@@ -416,6 +420,14 @@ class TestTeacherExecutor:
         assert registry["early"].hidden_dtype == torch.float32
         assert registry["early"].projection_dtype == torch.float32
 
+    def test_evict_idle_gpu_delegates_to_the_head_cache(self, sources, tokenizer):
+        registry = make_registry({"early": sources["a"]}, tokenizer)
+        executor = make_executor(registry)
+        score_single(executor, registry, make_microbatch([0]))
+        executor.evict_idle_gpu()
+        assert executor.head_cache.evictions == 1
+        assert executor.stats.live_device_weight_bytes == 0
+
     def test_hidden_and_logit_parity_with_a_plain_forward(self, sources, tokenizer):
         registry = make_registry({"early": sources["a"]}, tokenizer)
         # Score the whole microbatch in one forward so the comparison is bitwise: splitting the rows changes the
@@ -526,11 +538,13 @@ class TestTeacherExecutor:
         body = executor._load_body(0)
         module_ref = weakref.ref(body)
         backbone_ref = weakref.ref(body.model.layers[0].mlp.gate_proj.weight)
+        storage_ref = weakref.ref(body.model.layers[0].mlp.gate_proj.weight.untyped_storage())
         embedding_ref = weakref.ref(body.model.embed_tokens.weight)
         del body
         executor._load_body(1)  # evicts the first body from the single CPU slot
         assert module_ref() is None
         assert backbone_ref() is None
+        assert storage_ref() is None  # the parameter storage itself, not just the tensor wrapper
         assert embedding_ref() is None
         # The head source survives its body and still projects the same logits.
         microbatch = make_microbatch([0])
@@ -835,3 +849,28 @@ class TestWindowStore:
         }
         with pytest.raises(ValueError, match="has no rows"):
             store.plan_window([empty], target_cache_bytes=1 << 20)
+
+
+@require_torch_accelerator
+class TestTeacherExecutorOnAccelerator:
+    """Device-only properties: pinned staging, blocking device-to-host copies and device weight release.
+
+    The CPU suite cannot establish these; `.to()` is a no-op copy there, so the substituted parameters alias the CPU
+    source and the staging tile is unpinned.
+    """
+
+    def test_scoring_on_device_keeps_the_source_on_cpu(self, sources, tokenizer):
+        registry = make_registry({"early": sources["a"]}, tokenizer)
+        executor = TeacherExecutor(registry, FakeHeadCache(), torch.device(torch_device), scoring_batch_size=2)
+        microbatch = make_microbatch([0, 0])
+        block, positions, _ = score_single(executor, registry, microbatch)
+        assert block.hidden.device.type == "cpu"
+        assert executor._staging.is_pinned()
+        assert executor.stats.live_device_weight_bytes == 0
+        assert executor.stats.peak_device_weight_bytes > 0
+        body = executor._load_body(0)
+        assert {tensor.device.type for tensor in body.parameters()} == {"cpu"}
+        source = executor.retain_head_source(0)
+        assert source.weight.device.type == "cpu"
+        reference_hidden, _ = reference_forward(sources["a"], microbatch)
+        torch.testing.assert_close(block.hidden, reference_hidden[positions], rtol=1e-3, atol=1e-3)
