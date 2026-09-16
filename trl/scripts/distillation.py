@@ -33,6 +33,19 @@ python trl/scripts/distillation.py \
     --output_dir Qwen2.5-0.5B-Distillation
 ```
 
+# Multiple teachers (MOPD)
+```bash
+python trl/scripts/distillation.py \
+    --model_name_or_path Qwen/Qwen2.5-0.5B-Instruct \
+    --teacher_model_name_or_path '{"small": "Qwen/Qwen2.5-1.5B-Instruct", "large": "Qwen/Qwen2.5-7B-Instruct"}' \
+    --dataset_name trl-lib/ultrafeedback-prompt \
+    --learning_rate 2.0e-5 \
+    --num_train_epochs 1 \
+    --output_dir Qwen2.5-0.5B-Distillation
+```
+The dataset must carry a `teacher_id` column whose values are the mapping's routing IDs (`"small"` / `"large"` here):
+each row is scored by the teacher it names.
+
 # LoRA
 ```bash
 python trl/scripts/distillation.py \
@@ -61,7 +74,9 @@ def main(script_args, training_args, model_args, dataset_args):
 
     if training_args.teacher_model_name_or_path is None:
         raise ValueError(
-            "A teacher model is required for distillation training. Set it with `--teacher_model_name_or_path`."
+            "A teacher model is required for distillation training. Set it with `--teacher_model_name_or_path`, "
+            "either a single model name or path or a JSON mapping from routing ID to model for multi-teacher "
+            "distillation."
         )
 
     quantization_config = get_quantization_config(model_args)
