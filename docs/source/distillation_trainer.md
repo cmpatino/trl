@@ -305,6 +305,21 @@ trainer.train()
 - Students must be text-only. VLM students are not supported in multi-teacher mode; use the single `teacher_model` argument for VLM distillation.
 - DeepSpeed ZeRO-3 is rejected: the teacher head is uploaded as a plain device tensor, while the chunked loss only knows how to gather a ZeRO-partitioned head. Use ZeRO stage 1 or 2, or the single `teacher_model` argument.
 
+### Command line interface
+
+Pass `--teacher_model_name_or_path` a JSON object mapping routing IDs to teacher checkpoints; any value that does not start with `{` is kept as a single model name or path, i.e. the single-teacher behaviour. The dataset passed via `--dataset_name` must then carry a `teacher_id` column whose values are exactly those routing IDs.
+
+```bash
+trl distillation \
+    --model_name_or_path Qwen/Qwen2.5-0.5B-Instruct \
+    --teacher_model_name_or_path '{"math": "Qwen/Qwen2.5-Math-1.5B-Instruct", "code": "Qwen/Qwen2.5-Coder-1.5B-Instruct"}' \
+    --dataset_name your-org/your-routed-dataset \
+    --output_dir mopd-student \
+    --num_train_epochs 1
+```
+
+Use `--teacher_model_init_kwargs_by_teacher` (e.g. `'{"code": {"revision": "<revision-name>"}}'`) to override loading kwargs for one teacher without affecting the others.
+
 ### Memory
 
 Teachers are inference-only sources: they never enter the student's module tree, the optimizer, or the accelerator's model preparation.

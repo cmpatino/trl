@@ -40,8 +40,14 @@ class DistillationConfig(_BaseConfig):
             Whether to allow loading models and tokenizers that ship custom Python code from the Hub. Forwarded to
             [`~transformers.AutoModelForCausalLM.from_pretrained`] and [`~transformers.AutoTokenizer.from_pretrained`],
             for both the student and teacher.
-        teacher_model_name_or_path (`str`, *optional*):
-            Model name or path for the teacher model. Used when the teacher is loaded locally.
+        teacher_model_name_or_path (`str` or `dict[str, str]`, *optional*):
+            Teacher model to distill from. A plain string is a single teacher, resident on the accelerator for the
+            whole run. A JSON object string, e.g.
+            `'{"math": "Qwen/Qwen2.5-Math-1.5B-Instruct", "code": "Qwen/Qwen2.5-Coder-1.5B-Instruct"}'`, is parsed
+            into a `dict[str, str]` mapping routing IDs to model names or paths, and opts into multi-teacher
+            distillation: each row is scored by the teacher named in the dataset's `teacher_id` column. Only strings
+            starting with `{` are parsed as JSON; any other string stays a model name or path. Per-teacher loading
+            overrides go in `teacher_model_init_kwargs_by_teacher`.
         teacher_model_revision (`str`, *optional*):
             Model revision of the teacher model (e.g., branch name, tag, or commit hash).
         teacher_model_init_kwargs (`str` or `dict[str, Any]`, *optional*):
@@ -167,6 +173,7 @@ class DistillationConfig(_BaseConfig):
 
     _VALID_DICT_FIELDS = _BaseConfig._VALID_DICT_FIELDS + [
         "model_init_kwargs",
+        "teacher_model_name_or_path",
         "teacher_model_init_kwargs",
         "teacher_model_init_kwargs_by_teacher",
         "generation_kwargs",
@@ -196,9 +203,14 @@ class DistillationConfig(_BaseConfig):
             "student and teacher."
         },
     )
-    teacher_model_name_or_path: str | None = field(
+    teacher_model_name_or_path: dict[str, str] | str | None = field(
         default=None,
-        metadata={"help": "Model name or path for the teacher model."},
+        metadata={
+            "help": "Teacher model to distill from. A plain string is a single resident teacher; a JSON object "
+            "string mapping routing IDs to model names or paths opts into multi-teacher distillation, where each "
+            "row is scored by the teacher named in the dataset's `teacher_id` column. Only strings starting with "
+            "`{` are parsed as JSON. Per-teacher loading overrides go in `teacher_model_init_kwargs_by_teacher`."
+        },
     )
     teacher_model_revision: str | None = field(
         default=None,
