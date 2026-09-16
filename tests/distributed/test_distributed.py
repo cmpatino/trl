@@ -496,3 +496,36 @@ class TestDistributed(TrlTestCase):
             os.environ.copy(),
         )
         # fmt: on
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            "ddp",
+            pytest.param(
+                "zero2",
+                marks=pytest.mark.xfail(
+                    Version(transformers.__version__) == Version("5.1.0"),
+                    reason="Upstream incompatibility: deepspeed and transformers==5.1.0 (see transformers#43780)",
+                ),
+            ),
+            "fsdp2",
+        ],
+    )
+    def test_distillation_multi_teacher(self, config, get_config_path):
+        # Multi-teacher distillation (MOPD) rejects DeepSpeed ZeRO-3, so this case is not parametrized over it. This
+        # only checks that the CLI run exits cleanly on each backend.
+        # fmt: off
+        run_command(
+            [
+                "accelerate", "launch", "--config_file", get_config_path(config), "trl/scripts/distillation.py",
+                "--output_dir", self.tmp_dir,
+                "--model_name_or_path", "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
+                "--teacher_model_name_or_path", '{"teacher_a": "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5", "teacher_b": "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5"}',
+                "--dataset_name", "trl-internal-testing/zen",
+                "--dataset_config", "standard_prompt_only_teacher_id",
+                "--max_completion_length", "32",
+                "--report_to", "none",
+            ],
+            os.environ.copy(),
+        )
+        # fmt: on
