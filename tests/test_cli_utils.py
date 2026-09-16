@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import tempfile
 from dataclasses import dataclass
 from unittest.mock import mock_open, patch
@@ -45,6 +46,12 @@ class TestTrlParser(TrlTestCase):
             (GRPOConfig, "generation_kwargs", '{"suppress_tokens": [1, 2]}', {"suppress_tokens": [1, 2]}),
             (RLOOConfig, "chat_template_kwargs", '{"enable_thinking": false}', {"enable_thinking": False}),
             (DistillationConfig, "generation_kwargs", '{"suppress_tokens": [1]}', {"suppress_tokens": [1]}),
+            (
+                DistillationConfig,
+                "teacher_model_name_or_path",
+                '{"small": "Qwen/Qwen2.5-1.5B-Instruct", "large": "Qwen/Qwen2.5-7B-Instruct"}',
+                {"small": "Qwen/Qwen2.5-1.5B-Instruct", "large": "Qwen/Qwen2.5-7B-Instruct"},
+            ),
         ],
     )
     def test_dict_field_from_command_line(self, config_cls, field_name, value, expected):
@@ -52,6 +59,20 @@ class TestTrlParser(TrlTestCase):
         parser = TrlParser(dataclass_types=[config_cls])
         (config,) = parser.parse_args_into_dataclasses(["--output_dir", "dummy", f"--{field_name}", value])
         assert getattr(config, field_name) == expected
+
+    def test_teacher_model_name_or_path_keeps_a_plain_model_id(self):
+        """The same field also takes a single teacher, which must stay the string it was given."""
+        parser = TrlParser(dataclass_types=[DistillationConfig])
+        (config,) = parser.parse_args_into_dataclasses(
+            ["--output_dir", "dummy", "--teacher_model_name_or_path", "Qwen/Qwen2.5-7B-Instruct"]
+        )
+        assert config.teacher_model_name_or_path == "Qwen/Qwen2.5-7B-Instruct"
+
+    def test_teacher_model_name_or_path_rejects_malformed_json(self):
+        """A value that opens a JSON object is decoded as one: a truncated mapping is an error, not a model ID."""
+        parser = TrlParser(dataclass_types=[DistillationConfig])
+        with pytest.raises(json.JSONDecodeError):
+            parser.parse_args_into_dataclasses(["--output_dir", "dummy", "--teacher_model_name_or_path", '{"small": '])
 
     def test_init_without_config_field(self):
         """Test initialization without 'config' field in the dataclasses."""

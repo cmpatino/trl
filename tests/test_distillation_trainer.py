@@ -1897,6 +1897,13 @@ class TestDistillationTrainerMultiTeacher(TrlTestCase):
                 args=DistillationConfig(output_dir=self.tmp_dir, report_to="none"),
             )
 
+    def test_teacher_model_name_or_path_mapping_registers_the_teachers(self, teachers):
+        # `args.teacher_model_name_or_path` is the config-side (command-line) spelling of the teacher argument: a
+        # mapping given there must register exactly the routed teachers it names.
+        args = DistillationConfig(output_dir=self.tmp_dir, report_to="none", teacher_model_name_or_path=teachers)
+        trainer = DistillationTrainer(model=self.model_id, args=args)
+        assert list(trainer.teacher_models) == ["a", "b"]
+
     def test_per_teacher_init_kwargs(self, teachers):
         # Per-ID loading overrides really reach the loader. Two observable effects through public API:
         # (1) the dtype a teacher materializes in is recorded in the saved manifest, and it is part of the teacher's

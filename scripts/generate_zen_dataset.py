@@ -102,6 +102,36 @@ def main(test_size, push_to_hub, repo_id):
     if push_to_hub:
         standard_prompt_only_dataset.push_to_hub(repo_id, config_name="standard_prompt_only")
 
+    # Same prompts as `standard_prompt_only`, with a `teacher_id` column alternating between two routing IDs, for
+    # multi-teacher distillation (MOPD) tests.
+    standard_prompt_only_teacher_id_dataset = Dataset.from_dict({
+        "prompt": [
+            "Beautiful is better than",
+            "Explicit is",
+            "Simple is better",
+            "Complex",
+            "Flat is better than",
+            "Sparse is better",
+            "Readability",
+            "Special cases aren't special",
+            "Although practicality beats",
+            "Errors should never",
+            "Unless explicitly",
+            "In the face of ambiguity, refuse",
+            "There should be one-- and preferably",
+            "Although that way may not be obvious at first unless you're",
+            "Now is",
+            "Although never is often",
+            "If the implementation is hard to explain,",
+            "If the implementation is easy",
+            "Namespaces are one honking great",
+        ],
+        "teacher_id": (["teacher_a", "teacher_b"] * 10)[:19],
+    })
+    standard_prompt_only_teacher_id_dataset = standard_prompt_only_teacher_id_dataset.train_test_split(test_size=test_size, shuffle=False)
+    if push_to_hub:
+        standard_prompt_only_teacher_id_dataset.push_to_hub(repo_id, config_name="standard_prompt_only_teacher_id")
+
     standard_prompt_completion_dataset = Dataset.from_dict({
         "prompt": [
             "Beautiful is better than",
