@@ -142,6 +142,10 @@ class DistillationConfig(_BaseConfig):
 
         > Parameters that control the logging
 
+        overlap_top_k (`int`, *optional*, defaults to `16`):
+            Number of top tokens used for the `overlap/*` metrics (top-k overlap ratio, overlap-token advantage,
+            overlap mass) logged during training, following https://huggingface.co/papers/2604.13016 and
+            https://huggingface.co/papers/2609.04172.
         log_completions (`bool`, *optional*, defaults to `False`):
             Whether to log a sample of (prompt, completion) pairs every `logging_steps` steps. If `rich` is installed,
             it prints the sample. If `wandb` and/or `trackio` logging is enabled, it logs it to `wandb` and/or
@@ -369,6 +373,14 @@ class DistillationConfig(_BaseConfig):
     )
 
     # Parameters that control the logging
+    overlap_top_k: int = field(
+        default=16,
+        metadata={
+            "help": "Number of top tokens used for the `overlap/*` metrics (top-k overlap ratio, overlap-token "
+            "advantage, overlap mass) logged during training, following https://huggingface.co/papers/2604.13016 "
+            "and https://huggingface.co/papers/2609.04172."
+        },
+    )
     log_completions: bool = field(
         default=False,
         metadata={
@@ -394,6 +406,9 @@ class DistillationConfig(_BaseConfig):
 
         if self.beta < 0.0 or self.beta > 1.0:
             raise ValueError(f"beta must be in [0.0, 1.0], got {self.beta}.")
+
+        if self.overlap_top_k < 1:
+            raise ValueError(f"overlap_top_k must be >= 1, got {self.overlap_top_k}.")
 
         if self.parallelism_config is not None and (
             self.parallelism_config.cp_enabled or self.parallelism_config.sp_enabled

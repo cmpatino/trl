@@ -94,6 +94,15 @@ While training and evaluating, we record the following metrics:
 - `tools/call_frequency`: The average number of tool calls per completion in the generation batch. Logged only when `tools` are provided.
 - `tools/failure_frequency`: The fraction of tool calls that failed (the tool was not found, raised an exception, or the call type is unsupported). It is `0.0` when no tool was called. Logged only when `tools` are provided.
 - `entropy`: Average entropy of token predictions across generated completions (in nats).
+- `teacher_entropy`: Average entropy of the teacher's token predictions across generated completions (in nats).
+- `entropy_gap`: Average absolute gap between `teacher_entropy` and `entropy`, following [Rethinking On-Policy Distillation of LLMs: Phenomenology, Mechanism, and Recipe](https://huggingface.co/papers/2604.13016) (Eq. 8).
+- `overlap/ratio`: Average fraction of the student's top-`overlap_top_k` tokens that also appear in the teacher's top-`overlap_top_k` tokens, following the same paper (Eq. 6).
+- `overlap/advantage`: Average teacher-over-student log-probability advantage on the tokens shared between the student's and teacher's top-`overlap_top_k` sets, renormalized over that shared set, following the same paper (Eq. 7).
+- `overlap/student_mass`: Average (unnormalized) probability mass the student places on the tokens shared between the student's and teacher's top-`overlap_top_k` sets, following the same paper (Eq. 9).
+- `overlap/teacher_mass`: Average (unnormalized) probability mass the teacher places on the tokens shared between the student's and teacher's top-`overlap_top_k` sets, following the same paper (Eq. 10).
+- `sampled/logp_gap`: Average difference between the teacher's and the student's log-probability of the sampled completion token.
+- `sampled/logp_distance`: Average absolute value of `sampled/logp_gap`.
+- `sampled/absorption_rate`: Fraction of `sampled/logp_distance` closed since the previous logging step, following [Rethinking On-Policy Distillation of LLMs II: One Training Example](https://huggingface.co/papers/2609.04172) (Eq. 7); it is computed between consecutive logging steps and is `None` on the first log.
 
 ## Customization
 

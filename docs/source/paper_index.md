@@ -1911,6 +1911,31 @@ Expected dataset columns:
 
 For more details, see the [SSD Trainer documentation](ssd_trainer).
 
+### Rethinking On-Policy Distillation of LLMs: Phenomenology, Mechanism, and Recipe
+
+**📜 Paper**: https://huggingface.co/papers/2604.13016
+
+Studies why on-policy distillation works by tracking, over training, the overlap between the student's and teacher's top-k next-token predictions, and defines the overlap ratio, overlap-token advantage, entropy gap, and overlap mass used to characterize that dynamic. `DistillationTrainer` logs these training-progress metrics — `entropy`, `teacher_entropy`, `entropy_gap`, `overlap/ratio`, `overlap/advantage`, `overlap/student_mass`, and `overlap/teacher_mass` — computed over the top `overlap_top_k` tokens of the student and teacher distributions.
+
+```python
+from trl import DistillationConfig
+
+training_args = DistillationConfig(
+    ...,
+    overlap_top_k=16,  # top-k used by the overlap/* metrics
+)
+```
+
+For more details, see the [Distillation Trainer documentation](distillation_trainer).
+
+### Rethinking On-Policy Distillation of LLMs II: One Training Example
+
+**📜 Paper**: https://huggingface.co/papers/2609.04172
+
+Studies on-policy distillation from a single training example and defines the distance between the student and teacher distributions on the sampled token, along with the absorption rate at which that distance shrinks from one step to the next. `DistillationTrainer` logs the corresponding training-progress metrics, `sampled/logp_gap`, `sampled/logp_distance`, and `sampled/absorption_rate`, with the absorption rate computed as the fractional decrease in `sampled/logp_distance` between consecutive logging steps.
+
+For more details, see the [Distillation Trainer documentation](distillation_trainer).
+
 ## Distributed Training
 
 ### ZeRO: Memory Optimizations Toward Training Trillion Parameter Models

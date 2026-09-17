@@ -26,7 +26,7 @@ from transformers.utils import is_peft_available
 
 from trl import DistillationConfig, DistillationTrainer
 from trl.experimental.gkd.gkd_trainer import GKDTrainer
-from trl.trainer.distillation_trainer import _chunked_divergence_loss
+from trl.trainer.distillation_trainer import _METRIC_KEYS, _chunked_divergence_loss
 
 from .testing_utils import (
     TrlTestCase,
@@ -111,6 +111,81 @@ def _reference_chunked_divergence(
     return per_token.sum() / denom
 
 
+def _reference_metrics(
+    student_hidden,
+    teacher_hidden,
+    student_w,
+    teacher_w,
+    completion_mask,
+    target_ids,
+    top_k,
+    s_bias=None,
+    t_bias=None,
+    s_scale=1.0,
+    t_scale=1.0,
+    s_softcap=None,
+    t_softcap=None,
+    temperature=1.0,
+):
+    """Naive full-vocab reference for the 9 metric sums returned by `_chunked_divergence_loss` (in `_METRIC_KEYS`
+    order), computed position by position straight from the definitions instead of the chunked, index-only path."""
+    # Op order mirrors `_reference_chunked_divergence` / the loss's chunk body: matmul, + bias, * scale, softcap,
+    # / temperature.
+    student_logits = student_hidden.float() @ student_w.float().t()
+    teacher_logits = teacher_hidden.float() @ teacher_w.float().t()
+    if s_bias is not None:
+        student_logits = student_logits + s_bias.float()
+    if t_bias is not None:
+        teacher_logits = teacher_logits + t_bias.float()
+    if s_scale != 1.0:
+        student_logits = student_logits * s_scale
+    if s_softcap is not None:
+        student_logits = s_softcap * torch.tanh(student_logits / s_softcap)
+    if t_scale != 1.0:
+        teacher_logits = teacher_logits * t_scale
+    if t_softcap is not None:
+        teacher_logits = t_softcap * torch.tanh(teacher_logits / t_softcap)
+    student_logits = student_logits / temperature
+    teacher_logits = teacher_logits / temperature
+    student_log_probs = torch.log_softmax(student_logits, dim=-1)
+    teacher_log_probs = torch.log_softmax(teacher_logits, dim=-1)
+    student_probs, teacher_probs = student_log_probs.exp(), teacher_log_probs.exp()
+
+    B, K, _ = student_log_probs.shape
+    sums = torch.zeros(len(_METRIC_KEYS))
+    for b in range(B):
+        for k in range(K):
+            if completion_mask[b, k] == 0:
+                continue
+            p_lp, q_lp = student_log_probs[b, k], teacher_log_probs[b, k]
+            p, q = student_probs[b, k], teacher_probs[b, k]
+
+            student_entropy = -(p * p_lp).sum()
+            teacher_entropy = -(q * q_lp).sum()
+            sums[0] += student_entropy
+            sums[1] += teacher_entropy
+            sums[2] += (teacher_entropy - student_entropy).abs()
+
+            s_idx = set(p_lp.topk(top_k).indices.tolist())
+            t_idx = set(q_lp.topk(top_k).indices.tolist())
+            shared = sorted(s_idx & t_idx)  # I = S_p ∩ S_q
+            sums[3] += len(shared) / top_k
+
+            if shared:  # an empty intersection contributes 0 to the advantage and the overlap masses
+                idx = torch.tensor(shared, dtype=torch.long)
+                p_shared, q_shared = p[idx], q[idx]
+                p_tilde, q_tilde = p_shared / p_shared.sum(), q_shared / q_shared.sum()
+                advantage = (p_tilde * (q_tilde.log() - p_tilde.log())).sum() / len(shared)
+                sums[4] += advantage
+                sums[5] += p_shared.sum()
+                sums[6] += q_shared.sum()
+
+            y = int(target_ids[b, k])
+            sums[7] += q_lp[y] - p_lp[y]
+            sums[8] += (q_lp[y] - p_lp[y]).abs()
+    return sums
+
+
 class TestChunkedDivergenceLoss(TrlTestCase):
     """Unit tests for the memory-efficient chunked JSD loss (`_chunked_divergence_loss`)."""
 
@@ -134,6 +209,20 @@ class TestChunkedDivergenceLoss(TrlTestCase):
         torch.testing.assert_close(loss, expected)
         assert n_valid.item() == int(mask.sum().item())
 
+    @pytest.mark.parametrize("top_k", [1, 4])  # 1 naturally gives some disjoint (student, teacher) top-k sets
+    @pytest.mark.parametrize("chunk_size", [3, 4, 100])  # divides / doesn't divide / exceeds n_valid (= 9)
+    def test_metrics_match_naive_full_vocab(self, top_k, chunk_size):
+        sh, th, sw, tw, mask = self._inputs()
+        g = torch.Generator().manual_seed(4)
+        target_ids = torch.randint(0, sw.size(0), mask.shape, generator=g)  # (B, K), V = 17
+        _, stats, n_valid = _chunked_divergence_loss(
+            sh, th, sw, tw, mask, beta=0.5, chunk_size=chunk_size, target_ids=target_ids, top_k=top_k
+        )
+        expected = _reference_metrics(sh, th, sw, tw, mask, target_ids, top_k)
+        assert torch.isfinite(stats).all()
+        torch.testing.assert_close(stats, expected)
+        assert n_valid.item() == int(mask.sum().item())
+
     def test_bf16_hidden_fp32_weight(self):
         """A bf16 hidden state against an fp32 `lm_head` weight projects without a dtype mismatch."""
         sh, th, sw, tw, mask = self._inputs()
@@ -149,7 +238,8 @@ class TestChunkedDivergenceLoss(TrlTestCase):
         sw, tw = torch.randn(V, 8, generator=g), torch.randn(V, 12, generator=g)
         mask = torch.ones(B, K)
         mask[1, -1] = 0
-        loss, _, _ = _chunked_divergence_loss(sh, th, sw, tw, mask, beta=0.5, chunk_size=4)
+        # top_k=4 (< V=13): the default `overlap_top_k` (16) would exceed this test's small vocabulary.
+        loss, _, _ = _chunked_divergence_loss(sh, th, sw, tw, mask, beta=0.5, chunk_size=4, top_k=4)
         expected = _reference_chunked_divergence(sh, th, sw, tw, mask, beta=0.5)
         torch.testing.assert_close(loss, expected)
 
@@ -217,8 +307,9 @@ class TestChunkedDivergenceLoss(TrlTestCase):
         mask = torch.ones(B, K)
         mask[0, -1] = 0
         labels = torch.where(mask.bool(), torch.ones_like(mask, dtype=torch.long), torch.full_like(mask, -100).long())
+        # top_k=4 (< V=11): the default `overlap_top_k` (16) would exceed this test's small vocabulary.
         loss, _, _ = _chunked_divergence_loss(
-            student_logits, teacher_logits, eye, eye, mask, beta, chunk_size=4, num_items_in_batch=1
+            student_logits, teacher_logits, eye, eye, mask, beta, chunk_size=4, num_items_in_batch=1, top_k=4
         )
         gkd = GKDTrainer.generalized_jsd_loss(
             student_logits, teacher_logits, labels=labels, beta=beta, reduction="sum"
@@ -295,6 +386,7 @@ class TestDistillationTrainer(TrlTestCase):
             learning_rate=0.1,  # use higher lr because gradients are tiny and default lr can stall updates
             per_device_train_batch_size=3,  # reduce the batch size to reduce memory usage
             max_completion_length=8,  # reduce the completion length to reduce memory usage
+            logging_steps=1,  # log every step so at least two steps are logged (needed for sampled/absorption_rate)
             report_to="none",
         )
         trainer = DistillationTrainer(
@@ -310,8 +402,14 @@ class TestDistillationTrainer(TrlTestCase):
 
         assert trainer.state.log_history[-1]["train_loss"] is not None
 
-        # The student entropy metric is logged (item 61).
-        assert any("entropy" in entry for entry in trainer.state.log_history)
+        # The train log entries (identified by the presence of `entropy`, which excludes the final `train_loss`
+        # summary entry) log every metric, and `sampled/absorption_rate` is defined once at least two steps logged.
+        train_log_entries = [entry for entry in trainer.state.log_history if "entropy" in entry]
+        assert len(train_log_entries) >= 2
+        last_entry = train_log_entries[-1]
+        for key in (*_METRIC_KEYS, "sampled/absorption_rate"):
+            assert key in last_entry
+        assert last_entry["sampled/absorption_rate"] is not None
 
         # Check that the params have changed
         for n, param in previous_trainable_params.items():
@@ -1139,6 +1237,11 @@ class TestDistillationTrainer(TrlTestCase):
                 args=DistillationConfig(output_dir=self.tmp_dir, report_to="none"),
                 train_dataset=dataset,
             )
+
+    def test_overlap_top_k_must_be_positive(self):
+        # `overlap_top_k` sizes the top-k sets used by the `overlap/*` metrics, so it must be at least 1.
+        with pytest.raises(ValueError, match="overlap_top_k"):
+            DistillationConfig(output_dir=self.tmp_dir, overlap_top_k=0)
 
     def test_teacher_model_init_kwargs_with_instantiated_teacher_raises(self):
         # `teacher_model_init_kwargs` only applies when the teacher is a model id; passing it alongside an already

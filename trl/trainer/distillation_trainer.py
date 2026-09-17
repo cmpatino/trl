@@ -101,8 +101,21 @@ logger = get_logger(__name__)
 # (mirrors SFT's `_CHUNKED_LM_HEAD_CHUNK_SIZE`).
 _CHUNKED_LM_HEAD_CHUNK_SIZE = 256
 
+# Order of the metric sums returned by `_chunked_divergence_loss`.
+_METRIC_KEYS = (
+    "entropy",
+    "teacher_entropy",
+    "entropy_gap",
+    "overlap/ratio",
+    "overlap/advantage",
+    "overlap/student_mass",
+    "overlap/teacher_mass",
+    "sampled/logp_gap",
+    "sampled/logp_distance",
+)
 
-def _chunk(h_s, w_s, b_s, s_scale, s_softcap, h_t, w_t, b_t, t_scale, t_softcap, beta, temperature, valid):
+
+def _chunk(h_s, w_s, b_s, s_scale, s_softcap, h_t, w_t, b_t, t_scale, t_softcap, beta, temperature, tgt, top_k, valid):
     # Project both hidden states to vocab logits inside the checkpointed body so only `(chunk, H)` is retained across
     # the backward, never `(chunk, V)`. ZeRO-3 shards the `lm_head`, so gather it tightly around each projection.
     # `logit_scale` (Cohere) / `final_logit_softcapping` (Gemma) are applied per model to match its full forward.
@@ -154,8 +167,49 @@ def _chunk(h_s, w_s, b_s, s_scale, s_softcap, h_t, w_t, b_t, t_scale, t_softcap,
 
     # A chunk's tail may hold positions packed out of the valid prefix; zero those rows before summing.
     per_token_jsd = jsd.sum(dim=-1) * valid
-    per_token_entropy = -(student_log_probs.exp() * student_log_probs).sum(dim=-1) * valid
-    return per_token_jsd.sum(), per_token_entropy.sum()
+
+    # Distillation progress metrics, computed here because this is the only place where both full-vocab
+    # distributions exist. They are gradient-free, hence `no_grad`.
+    with torch.no_grad():
+        student_entropy = -(student_log_probs.exp() * student_log_probs).sum(dim=-1)
+        teacher_entropy = -(teacher_log_probs.exp() * teacher_log_probs).sum(dim=-1)
+        # Top-k overlap: which of the student's top-k tokens the teacher also ranks in its own top-k. Comparing the
+        # two index sets pairwise costs `(chunk, k, k)`, where a membership buffer would cost a whole vocabulary.
+        s_idx = student_log_probs.topk(top_k, dim=-1).indices
+        t_idx = teacher_log_probs.topk(top_k, dim=-1).indices
+        shared = (s_idx[:, :, None] == t_idx[:, None, :]).any(-1)
+        n_shared = shared.sum(dim=-1)
+        s_logp = student_log_probs.gather(-1, s_idx)
+        t_logp = teacher_log_probs.gather(-1, s_idx)
+        # Overlap-token advantage, with both distributions renormalized over the intersection. When the intersection
+        # is empty the masked `logsumexp` is `-inf` and the renormalized log-probs are `nan`, so select the shared
+        # terms with `torch.where` (a multiplication by a 0/1 mask would propagate the `nan`) and clamp the divisor.
+        s_shared = s_logp - s_logp.masked_fill(~shared, -torch.inf).logsumexp(dim=-1, keepdim=True)
+        t_shared = t_logp - t_logp.masked_fill(~shared, -torch.inf).logsumexp(dim=-1, keepdim=True)
+        advantage = torch.where(shared, s_shared.exp() * (t_shared - s_shared), 0.0).sum(dim=-1)
+        # Overlap masses are taken from the unnormalized distributions, so they say how much probability the
+        # intersection actually carries.
+        student_mass = torch.where(shared, s_logp.exp(), 0.0).sum(dim=-1)
+        teacher_mass = torch.where(shared, t_logp.exp(), 0.0).sum(dim=-1)
+        # Log-prob gap at the token the student actually sampled, whose absolute value is the distance the absorption
+        # rate is derived from.
+        sampled = tgt[:, None]
+        logp_gap = (teacher_log_probs.gather(-1, sampled) - student_log_probs.gather(-1, sampled)).squeeze(-1)
+        stats = torch.stack(
+            [
+                student_entropy,
+                teacher_entropy,
+                (teacher_entropy - student_entropy).abs(),
+                n_shared / top_k,
+                advantage / n_shared.clamp(min=1),
+                student_mass,
+                teacher_mass,
+                logp_gap,
+                logp_gap.abs(),
+            ]
+        )
+        stats = (stats * valid).sum(dim=-1)
+    return per_token_jsd.sum(), stats
 
 
 def _chunked_divergence_loss(
@@ -174,6 +228,8 @@ def _chunked_divergence_loss(
     student_final_logit_softcapping: float | None = None,
     teacher_final_logit_softcapping: float | None = None,
     temperature: float = 1.0,
+    target_ids: torch.Tensor | None = None,
+    top_k: int = 16,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Memory-efficient generalized JSD over student/teacher hidden states and their `lm_head` weights.
@@ -217,11 +273,21 @@ def _chunked_divergence_loss(
             If set, applies `softcap * tanh(logits / softcap)` to the teacher's logits, after the scale.
         temperature (`float`, *optional*, defaults to `1.0`):
             Softmax temperature applied to both distributions before the divergence, after any scale/softcapping.
+        target_ids (`torch.Tensor`, *optional*):
+            Sampled completion ids of shape `(B, K)`, used for the `sampled/*` metrics. When `None`, those two
+            metrics are computed at token `0` and are meaningless.
+        top_k (`int`, *optional*, defaults to `16`):
+            Number of top tokens of each distribution defining the intersection used by the `overlap/*` metrics.
 
     Returns:
-        `tuple[torch.Tensor, torch.Tensor, torch.Tensor]`: scalar loss, sum of per-token student entropy (in nats), and
+        `tuple[torch.Tensor, torch.Tensor, torch.Tensor]`: scalar loss, the `(9,)` vector of per-token metric sums, and
         number of valid completion positions — all over the local batch. Raw sums are returned so callers can reduce
-        correctly across ranks.
+        correctly across ranks. The metric sums follow `_METRIC_KEYS`: student entropy (in nats), teacher entropy,
+        absolute entropy gap, top-k overlap ratio, overlap-token advantage, student and teacher overlap mass (the
+        progress metrics of [Rethinking On-Policy Distillation of LLMs: Phenomenology, Mechanism, and
+        Recipe](https://huggingface.co/papers/2604.13016)), then the sampled token's log-prob gap and its absolute
+        value (the distance of [Rethinking On-Policy Distillation of LLMs II: One Training
+        Example](https://huggingface.co/papers/2609.04172)).
     """
     # Under FSDP2, lm_head.weight is a DTensor (Shard(0) or Replicate). Passing it directly into the
     # gradient-checkpointed chunk loop causes FSDP2 to re-gather it once per chunk during backward recomputation.
@@ -244,14 +310,17 @@ def _chunked_divergence_loss(
     h_t = teacher_hidden_states.reshape(-1, teacher_hidden_states.size(-1))
     valid = completion_mask.reshape(-1) != 0
     n_valid_tensor = valid.sum()
+    # The sampled token only feeds the `sampled/*` metrics, so callers that want the loss alone can leave it out.
+    tgt = (torch.zeros_like(completion_mask, dtype=torch.long) if target_ids is None else target_ids).reshape(-1)
 
-    entropy_sum = h_s.new_zeros((), dtype=torch.float32)
+    stats = h_s.new_zeros(len(_METRIC_KEYS), dtype=torch.float32)
 
     # Pack valid positions to the front so masked ones form whole trailing chunks. `argsort` on the boolean mask is a
     # static-shape op (unlike `h_s[valid]`, whose output shape is data-dependent and poisons XLA compilation).
     order = valid.to(torch.int8).argsort(descending=True, stable=True)
     h_s = h_s[order]
     h_t = h_t[order]
+    tgt = tgt[order]
     valid = valid[order]
 
     # Process only the whole chunks covering the valid prefix: bounds XLA recompiles and drops fully-masked chunks on
@@ -261,7 +330,7 @@ def _chunked_divergence_loss(
 
     loss = h_s.new_zeros((), dtype=torch.float32)
     for start in range(0, n_padded, chunk_size):
-        chunk_loss, chunk_entropy = torch.utils.checkpoint.checkpoint(
+        chunk_loss, chunk_stats = torch.utils.checkpoint.checkpoint(
             _chunk,
             h_s[start : start + chunk_size],
             student_lm_head_weight,
@@ -275,11 +344,13 @@ def _chunked_divergence_loss(
             teacher_final_logit_softcapping,
             beta,
             temperature,
+            tgt[start : start + chunk_size],
+            top_k,
             valid[start : start + chunk_size].float(),
             use_reentrant=False,
         )
         loss = loss + chunk_loss
-        entropy_sum = entropy_sum + chunk_entropy
+        stats = stats + chunk_stats
 
     if num_items_in_batch is None:
         # Clamped for the same reason: a fully-masked rank reduces to a finite zero rather than `0 / 0`.
@@ -288,7 +359,7 @@ def _chunked_divergence_loss(
         if isinstance(num_items_in_batch, torch.Tensor):
             num_items_in_batch = num_items_in_batch.to(loss.device)
         loss = loss / num_items_in_batch
-    return loss, entropy_sum, n_valid_tensor
+    return loss, stats, n_valid_tensor
 
 
 class DistillationTrainer(_BaseTrainer):
@@ -743,6 +814,7 @@ class DistillationTrainer(_BaseTrainer):
 
         # Store config values
         self.beta = args.beta
+        self.overlap_top_k = args.overlap_top_k
         self.temperature = args.temperature
         self.top_p = args.top_p
         self.top_k = args.top_k
@@ -788,6 +860,8 @@ class DistillationTrainer(_BaseTrainer):
 
         # Metrics & Logging
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
+        # Previously logged `sampled/logp_distance`, from which `log` derives `sampled/absorption_rate`.
+        self._prev_distance = {"train": None, "eval": None}
         self._total_train_tokens = 0
         self._current_train_step_time = 0.0
         self.log_completions = args.log_completions
@@ -1810,18 +1884,23 @@ class DistillationTrainer(_BaseTrainer):
         # `_forward_redirection`, so DDP.forward() fires `prepare_for_backward()` and FSDP/DeepSpeed keep the student's
         # sharded parameters (including the `lm_head`) materialized for the projection.
         unwrapped_student = self.accelerator.unwrap_model(model)
-        loss, entropy_sum, num_valid_tokens = self._forward_redirection(
+        loss, stats, num_valid_tokens = self._forward_redirection(
             model, unwrapped_student, self._compute_loss, unwrapped_student, inputs, num_items_in_batch
         )
 
-        # Log the mean per-token student entropy (in nats). The reduction runs here, after `_forward_redirection`
-        # returns, so the `gather_for_metrics` collective does not run inside the DDP/FSDP-wrapped forward (a hang/
-        # ordering risk). Mirrors `SFTTrainer.compute_loss`.
+        # Log the mean per-token distillation progress metrics: the student entropy (in nats), and alongside it the
+        # teacher/student entropy gap and top-k overlap metrics of https://huggingface.co/papers/2604.13016 and the
+        # sampled-token log-prob gap and distance of https://huggingface.co/papers/2609.04172. The reduction runs
+        # here, after `_forward_redirection` returns, so the `gather_for_metrics` collective does not run inside the
+        # DDP/FSDP-wrapped forward (a hang/ordering risk). Mirrors `SFTTrainer.compute_loss`.
         mode = "train" if self.model.training else "eval"
         num_valid_tokens = self.accelerator.gather_for_metrics(num_valid_tokens).sum()
-        entropy_sum = self.accelerator.gather_for_metrics(entropy_sum).sum()
-        entropy = (entropy_sum / num_valid_tokens).item() if num_valid_tokens > 0 else 0.0
-        self._metrics[mode]["entropy"].append(entropy)
+        # Plain `gather`: `stats`' first dimension indexes metrics, not samples, so `gather_for_metrics` would
+        # truncate it to the dataloader's remainder on the last batch.
+        stats = self.accelerator.gather(stats).reshape(-1, len(_METRIC_KEYS)).sum(0)
+        values = (stats / num_valid_tokens).tolist() if num_valid_tokens > 0 else [0.0] * len(_METRIC_KEYS)
+        for key, value in zip(_METRIC_KEYS, values, strict=True):
+            self._metrics[mode][key].append(value)
 
         return (loss, None) if return_outputs else loss
 
@@ -1885,7 +1964,7 @@ class DistillationTrainer(_BaseTrainer):
             teacher_logit_scale = getattr(teacher_config, "output_multiplier", None)
         student_logit_scale = 1.0 if student_logit_scale is None else student_logit_scale
         teacher_logit_scale = 1.0 if teacher_logit_scale is None else teacher_logit_scale
-        loss, entropy_sum, n_valid = _chunked_divergence_loss(
+        loss, stats, n_valid = _chunked_divergence_loss(
             student_hidden_states,
             teacher_hidden_states,
             student_lm_head.weight,
@@ -1901,10 +1980,12 @@ class DistillationTrainer(_BaseTrainer):
             student_final_logit_softcapping=getattr(student_config, "final_logit_softcapping", None),
             teacher_final_logit_softcapping=getattr(teacher_config, "final_logit_softcapping", None),
             temperature=self.temperature,
+            target_ids=inputs["completion_ids"],
+            top_k=self.overlap_top_k,
         )
-        # Return the raw entropy sum and valid-token count for `compute_loss` to aggregate and log after the forward
-        # returns (see there). Detached: the metric is gradient-free.
-        return loss, entropy_sum.detach(), n_valid
+        # Return the raw metric sums and valid-token count for `compute_loss` to aggregate and log after the forward
+        # returns (see there). Detached: the metrics are gradient-free.
+        return loss, stats.detach(), n_valid
 
     def training_step(self, model, inputs, num_items_in_batch):
         time_before = time.perf_counter()
@@ -1937,6 +2018,13 @@ class DistillationTrainer(_BaseTrainer):
             # loggers crash on float NaN).
             valid = [v for v in val if not math.isnan(v)]
             metrics[key] = sum(valid) / len(valid) if valid else None
+
+        # Absorption rate (https://huggingface.co/papers/2609.04172, Eq. 7): fraction of the sampled log-prob distance
+        # closed since the previous log. Undefined on the first log and when the previous distance is zero.
+        if metrics.get("sampled/logp_distance") is not None:
+            distance, prev = metrics["sampled/logp_distance"], self._prev_distance[mode]
+            metrics["sampled/absorption_rate"] = (prev - distance) / prev if prev else None
+            self._prev_distance[mode] = distance
 
         # This method can be called both in training and evaluation. When called in evaluation, the keys in `logs`
         # start with "eval_". We need to add the prefix "eval_" to the keys in `metrics` to match the format.
