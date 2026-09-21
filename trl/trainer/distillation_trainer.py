@@ -175,11 +175,10 @@ def _chunk(h_s, w_s, b_s, s_scale, s_softcap, h_t, w_t, b_t, t_scale, t_softcap,
         teacher_entropy = -(teacher_log_probs.exp() * teacher_log_probs).sum(dim=-1)
         # Top-k overlap: which of the student's top-k tokens the teacher also ranks in its own top-k. Comparing the
         # two index sets pairwise costs `(chunk, k, k)`, where a membership buffer would cost a whole vocabulary.
-        s_idx = student_log_probs.topk(top_k, dim=-1).indices
+        s_logp, s_idx = student_log_probs.topk(top_k, dim=-1)
         t_idx = teacher_log_probs.topk(top_k, dim=-1).indices
         shared = (s_idx[:, :, None] == t_idx[:, None, :]).any(-1)
         n_shared = shared.sum(dim=-1)
-        s_logp = student_log_probs.gather(-1, s_idx)
         t_logp = teacher_log_probs.gather(-1, s_idx)
         # Overlap-token advantage, with both distributions renormalized over the intersection. When the intersection
         # is empty the masked `logsumexp` is `-inf` and the renormalized log-probs are `nan`, so select the shared
@@ -1890,15 +1889,12 @@ class DistillationTrainer(_BaseTrainer):
 
         # Log the mean per-token distillation progress metrics: the student entropy (in nats), and alongside it the
         # teacher/student entropy gap and top-k overlap metrics of https://huggingface.co/papers/2604.13016 and the
-        # sampled-token log-prob gap and distance of https://huggingface.co/papers/2609.04172. The reduction runs
-        # here, after `_forward_redirection` returns, so the `gather` collective does not run inside the
-        # DDP/FSDP-wrapped forward (a hang/ordering risk). Mirrors `SFTTrainer.compute_loss`. Plain `gather` for both
-        # sums: `stats`' first dimension indexes metrics, not samples, so `gather_for_metrics` would truncate it to the
-        # dataloader's remainder on the last batch, and the token count must cover the same ranks as the sums it
-        # normalizes.
+        # sampled-token log-prob gap and distance of https://huggingface.co/papers/2609.04172. The per-rank sums and
+        # token count are summed across ranks here, after `_forward_redirection` returns, so the collective does not
+        # run inside the DDP/FSDP-wrapped forward (a hang/ordering risk). Mirrors `SFTTrainer.compute_loss`.
         mode = "train" if self.model.training else "eval"
-        num_valid_tokens = self.accelerator.gather(num_valid_tokens).sum()
-        stats = self.accelerator.gather(stats).reshape(-1, len(_METRIC_KEYS)).sum(0)
+        num_valid_tokens = self.accelerator.reduce(num_valid_tokens, reduction="sum")
+        stats = self.accelerator.reduce(stats, reduction="sum")
         values = (stats / num_valid_tokens).tolist() if num_valid_tokens > 0 else [0.0] * len(_METRIC_KEYS)
         for key, value in zip(_METRIC_KEYS, values, strict=True):
             self._metrics[mode][key].append(value)
