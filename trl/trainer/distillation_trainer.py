@@ -1891,12 +1891,13 @@ class DistillationTrainer(_BaseTrainer):
         # Log the mean per-token distillation progress metrics: the student entropy (in nats), and alongside it the
         # teacher/student entropy gap and top-k overlap metrics of https://huggingface.co/papers/2604.13016 and the
         # sampled-token log-prob gap and distance of https://huggingface.co/papers/2609.04172. The reduction runs
-        # here, after `_forward_redirection` returns, so the `gather_for_metrics` collective does not run inside the
-        # DDP/FSDP-wrapped forward (a hang/ordering risk). Mirrors `SFTTrainer.compute_loss`.
+        # here, after `_forward_redirection` returns, so the `gather` collective does not run inside the
+        # DDP/FSDP-wrapped forward (a hang/ordering risk). Mirrors `SFTTrainer.compute_loss`. Plain `gather` for both
+        # sums: `stats`' first dimension indexes metrics, not samples, so `gather_for_metrics` would truncate it to the
+        # dataloader's remainder on the last batch, and the token count must cover the same ranks as the sums it
+        # normalizes.
         mode = "train" if self.model.training else "eval"
-        num_valid_tokens = self.accelerator.gather_for_metrics(num_valid_tokens).sum()
-        # Plain `gather`: `stats`' first dimension indexes metrics, not samples, so `gather_for_metrics` would
-        # truncate it to the dataloader's remainder on the last batch.
+        num_valid_tokens = self.accelerator.gather(num_valid_tokens).sum()
         stats = self.accelerator.gather(stats).reshape(-1, len(_METRIC_KEYS)).sum(0)
         values = (stats / num_valid_tokens).tolist() if num_valid_tokens > 0 else [0.0] * len(_METRIC_KEYS)
         for key, value in zip(_METRIC_KEYS, values, strict=True):

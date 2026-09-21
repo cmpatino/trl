@@ -1915,7 +1915,7 @@ For more details, see the [SSD Trainer documentation](ssd_trainer).
 
 **📜 Paper**: https://huggingface.co/papers/2604.13016
 
-Studies why on-policy distillation works by tracking, over training, the overlap between the student's and teacher's top-k next-token predictions, and defines the overlap ratio, overlap-token advantage, entropy gap, and overlap mass used to characterize that dynamic. `DistillationTrainer` logs these training-progress metrics — `entropy`, `teacher_entropy`, `entropy_gap`, `overlap/ratio`, `overlap/advantage`, `overlap/student_mass`, and `overlap/teacher_mass` — computed over the top `overlap_top_k` tokens of the student and teacher distributions.
+Studies why on-policy distillation works by tracking, over training, the overlap between the student's and teacher's top-k next-token predictions, and defines the overlap ratio, overlap-token advantage, entropy gap, and overlap mass used to characterize that dynamic. `DistillationTrainer` logs these training-progress metrics: `entropy`, `teacher_entropy`, and `entropy_gap` over the full vocabulary, and `overlap/ratio`, `overlap/advantage`, `overlap/student_mass`, and `overlap/teacher_mass` over the top `overlap_top_k` tokens of the student and teacher distributions.
 
 ```python
 from trl import DistillationConfig
